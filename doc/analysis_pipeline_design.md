@@ -106,7 +106,7 @@ Principles:
 | `invID` | INT | owner (people.personID) |
 | `clusterDefault` | TEXT | the one cluster used by all stages |
 | `specJson` | JSON | full user spec (§4.3), immutable copy of what was submitted |
-| `status` | ENUM(`ACTIVE`,`FINISHED`,`FAILED`,`CANCELED`) | aggregate |
+| `status` | ENUM(`SETUP`,`ACTIVE`,`FINISHED`,`CANCELED`) DEFAULT `SETUP` | `SETUP`: rows being created, ignored by the scheduler; `ACTIVE`: scheduled; `FINISHED`/`CANCELED`: rows archived (§6.4) |
 | `createTime`, `updateTime`, `createUser`, `updateUser` | | |
 
 ### 4.2 Extensions to `autoflowAnalysis` / `autoflowAnalysisHistory`
@@ -131,8 +131,8 @@ The row `status` column carries the stage state directly:
 `COMPLETE` → `FINISHED` (outputs recorded) | `FAILED` | `CANCELED` | `BLOCKED` (a predecessor failed or was
 canceled) | `SKIPPED` (disabled before start).
 
-Rows stay in `autoflowAnalysis` until **all rows of the same pipeline** are terminal; only then are they moved
-to history (§6.4).
+Rows stay in `autoflowAnalysis` until the pipeline is finished or canceled; only then are they moved to history
+(§6.4).
 
 ### 4.3 Pipeline spec (`analysisPipeline.specJson`)
 
@@ -271,14 +271,17 @@ Legacy loop: add `WHERE pipelineID IS NULL` to its SELECT. Without it, a `PENDIN
 New pipeline loop (same process, after the legacy loop, per LIMS DB):
 
 ```
-SELECT … FROM autoflowAnalysis WHERE pipelineID IS NOT NULL ORDER BY pipelineID      # one query per DB
+SELECT … FROM autoflowAnalysis JOIN analysisPipeline USING (pipelineID)
+       WHERE analysisPipeline.status IN ('ACTIVE','CANCELED') ORDER BY pipelineID       # one query per DB
 for each pipeline P (in a transaction, rows locked FOR UPDATE):
+    rows with status CANCELED and currentGfacID set: scancel, clear currentGfacID
     for r in P with status in completed_status:   record outputs (§8), processed[], status = FINISHED
     for r in P with status in failed_status:      processed[], status = FAILED (scancel as today)
     repeat until stable: PENDING rows with a failed/canceled/blocked predecessor → BLOCKED
     for r in P with status PENDING and all predecessors FINISHED:
         resolve params (§7), pin inputs (§8), status = READY, spawn submitone.php
-    if all rows of P terminal: copy rows to history, delete, analysisPipeline.status := aggregate
+    if P.status == ACTIVE and all rows FINISHED/SKIPPED: P.status = FINISHED, archive (§6.4)
+    if P.status == CANCELED and no row has a running job:   archive (§6.4)
 ```
 
 Optional throttle: `max_running_per_pipeline` in `listen-config.php` (READY rows beyond the limit stay
@@ -286,8 +289,11 @@ Optional throttle: `max_running_per_pipeline` in `listen-config.php` (READY rows
 
 ### 6.4 History
 
-Rows move to `autoflowAnalysisHistory` **per pipeline**, when all its rows are terminal, so that group rows can
-still read member rows' outputs and the viewer shows the complete graph.
+Rows move to `autoflowAnalysisHistory` **per pipeline** (`DELETE`+`INSERT … SELECT *`, as for GMP rows), so that
+group rows can still read member rows' outputs and the viewer shows the complete graph. Archiving happens when
+the pipeline is `FINISHED` (all rows `FINISHED`/`SKIPPED`) or `CANCELED`. A pipeline with `FAILED`, `BLOCKED` or
+`CANCELED` rows stays `ACTIVE` (shown as "needs attention" in the viewer) until the user retries those rows or
+cancels the pipeline; otherwise a failure would be archived before it could be retried.
 
 ### 6.5 Runtime edits (pipeline viewer)
 
@@ -299,7 +305,11 @@ increment `revision`; the scheduler does the same. Conflicts are reported to the
 
 Cancel: row → `CANCELED` (running job: existing cancel path of `queue_viewer.php`); successors → `BLOCKED`.
 Retry: `FAILED`/`BLOCKED`/`CANCELED` → `PENDING`, its `BLOCKED` successors → `PENDING`.
-Cancel pipeline: all non-terminal rows → `CANCELED`.
+Cancel pipeline: all rows not `FINISHED`/`SKIPPED` → `CANCELED`, `analysisPipeline.status = CANCELED`.
+
+Creation (LIMS page): insert `analysisPipeline` (`SETUP`), synchronise the `autoflowAnalysis` auto-increment with
+the history table (same statement as `set_autoflowAnalysis_auto_increment`, so a `requestID` is never reused),
+insert the rows in topological order, then set `ACTIVE` — all in one transaction.
 
 ---
 
@@ -370,45 +380,18 @@ their `editedDataID` (to verify: noise ↔ editedData link in the `noise` table)
 | `jobmonitor/gridctl.php` | none expected (status update by `requestID`+`currentGfacID` is row-level). |
 | new `autoflow_util/pipeline_lib.php` | shared: spec validation (V1–V7), expansion spec → rows (one per stage instance), parameter resolution, noise resolution, readiness. Used by submitctl, submitone and the LIMS pages; the dbinst pages include it from the gridctl install (path in `config.php`) or a copy is kept in `us3lims_dbinst/lib/`. |
 
-### 9.2 `us3_sql`
+### 9.2 `us3_sql` (done)
 
-* `us3.sql`: `CREATE TABLE analysisPipeline` (§4.1) and the four columns of §4.2 in **both**
-  `autoflowAnalysis` and `autoflowAnalysisHistory` (the history move is `INSERT … SELECT *`, so column lists
-  must stay identical), index `(pipelineID)`.
-* New upgrade script for existing instances (repo has none yet), e.g. `upgrades/2026-analysis_pipeline.sql`:
-
-  ```sql
-  CREATE TABLE IF NOT EXISTS analysisPipeline (
-    pipelineID     int(11)      NOT NULL AUTO_INCREMENT,
-    name           varchar(255) NOT NULL,
-    invID          int(11)      NOT NULL,
-    clusterDefault text         DEFAULT "localhost",
-    specJson       json,
-    status         enum('ACTIVE','FINISHED','FAILED','CANCELED') DEFAULT 'ACTIVE',
-    createTime     timestamp    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updateTime     timestamp    DEFAULT 0 ON UPDATE CURRENT_TIMESTAMP,
-    createUser     varchar(128) DEFAULT (current_user()),
-    updateUser     varchar(128) DEFAULT "",
-    PRIMARY KEY (pipelineID),
-    KEY (invID)
-  ) ENGINE=InnoDB;
-
-  ALTER TABLE autoflowAnalysis
-    ADD COLUMN pipelineID int(11) DEFAULT NULL,
-    ADD COLUMN rowKind    enum('triple','group') NOT NULL DEFAULT 'triple',
-    ADD COLUMN groupName  varchar(80) DEFAULT NULL,
-    ADD COLUMN stageKey   varchar(32) DEFAULT NULL,
-    ADD KEY (pipelineID);
-  -- identical ALTER for autoflowAnalysisHistory
-  ```
-
-  Columns are appended at the end so existing positional `SELECT *` copies and readers keep working.
-* `us3_autoflow_procs.sql` (or new `us3_pipeline_procs.sql`, sourced from `us3_procedures.sql`):
-  `new_analysis_pipeline()` (creates pipeline + all rows in one transaction, returns `pipelineID`),
-  `new_analysis_pipeline_row()`, `get_analysis_pipeline()`, `get_analysis_pipeline_rows()`,
-  `update_analysis_pipeline_row_json(requestID, revision, json)` (revision-checked, §6.5),
-  `cancel_analysis_pipeline()`. All with `verify_user` and owner check (`invID`), like the existing procedures.
-  Existing `read_autoflowAnalysis_record` is unchanged.
+* `us3.sql`: table `analysisPipeline` (§4.1); columns `pipelineID`, `rowKind`, `groupName`, `stageKey` and index
+  `(pipelineID)` appended to **both** `autoflowAnalysis` and `autoflowAnalysisHistory` (the history move is
+  `INSERT … SELECT *`, so column lists must stay identical).
+* `upgrades/2026-11-analysis_pipeline.sql`: idempotent upgrade for existing instances (MariaDB
+  `ADD COLUMN IF NOT EXISTS`), ends with a check that both tables have identical column lists.
+* **No stored procedures.** The LIMS pages and `gridctl` access the instance DBs with direct SQL (no
+  `verify_user`-style calls exist in `us3lims_dbinst`); all pipeline reads/writes live in `pipeline_lib.php`.
+  Procedures for the desktop client can be added if a desktop view is wanted later.
+* Tested on MariaDB 10.11: fresh install, upgrade of the previous schema (run twice), GMP rows and GMP insert
+  path unchanged, history copy of pipeline rows.
 
 ### 9.3 `us3lims_dbinst` (user interface)
 
@@ -436,7 +419,7 @@ queue_viewer.php   + link per pipeline                           → pipeline_vi
 
 Server-side validation uses `pipeline_lib.php` (shared with gridctl, §9.1); a JS copy only gives immediate
 feedback. The page writes `analysisPipeline` and the rows (direct SQL with the LIMS `$link`, like the other
-dbinst pages, or the procedures of §9.2) in one transaction and does **not** submit a job itself; `submitctl`
+dbinst pages; sequence in §6.5) in one transaction and does **not** submit a job itself; `submitctl`
 picks up the READY rows on its next poll.
 
 What the LIMS session provides and the spec stores, so that `submitone.php` no longer has to fake it:
@@ -473,7 +456,7 @@ programs (e.g. `us_fematch`, `us_pseudo3d_combine`).
 
 | phase | content | repos |
 |-------|---------|-------|
-| P0 | Schema: `analysisPipeline`, new columns, upgrade script, procedures | us3_sql |
+| P0 | Schema: `analysisPipeline`, new columns, upgrade script (**done**) | us3_sql |
 | P1 | `pipeline_lib.php` (validation, expansion, resolution) + unit tests (CLI, fixtures) | gridctl |
 | P2 | `submitctl.php` pipeline loop, dataset stages only (no groups) | gridctl |
 | P3 | `submitone.php` v2 params, custom grid, PCSA, input pinning | gridctl |
