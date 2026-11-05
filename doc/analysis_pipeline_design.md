@@ -2,7 +2,7 @@
 
 Status: **draft for review** — no code changes yet.
 Repos affected: `us3lims_gridctl` (scheduler/submit), `us3lims_dbinst` (LIMS forms, minor),
-`ultrascan3` (client GUI), DB schema repo (tables / stored procedures; not attached to this work yet).
+`ultrascan3` (client GUI), `us3_sql` (tables / stored procedures).
 
 ---
 
@@ -35,6 +35,13 @@ Repos affected: `us3lims_gridctl` (scheduler/submit), `us3lims_dbinst` (LIMS for
 * **Status feedback.** `gridctl.php:update_autoflow_status()` updates `autoflowAnalysis` by
   `requestID = gfac.analysis.autoflowAnalysisID AND currentGfacID`. `cleanup_gfac.php:update_autoflow_models()`
   writes `autoflowModelsLink` keyed by `statusJson.submitted` (stage tag) and `autoflowID`.
+* **Schema** (`us3_sql/us3.sql:319-370`): `autoflowAnalysis` and `autoflowAnalysisHistory` have identical
+  columns; `tripleName`, `filename`, `aprofileGUID CHAR(36)`, `invID`, `autoflowID` are `NOT NULL`;
+  `statusJson` is `json`. `autoflowModelsLink.autoflowID` is `NOT NULL`. Rows are created by
+  `new_autoflow_analysis_record()` (`us3_autoflow_procs.sql:1283`, `verify_user` checked);
+  `set_autoflowAnalysis_auto_increment()` keeps `requestID` unique across live + history tables.
+  `us3_sql` has no migration scripts: `us3.sql` is a DROP/CREATE for new instances, procedures are reloaded
+  via `us3_procedures.sql`.
 * **Global fits already exist in the LIMS**: `queue_setup_3.php` `separate_datasets` = 0 (global) / 1 (separate) /
   2 (composite); `payload_manager.php` appends `-GL` to the method.
   Job-level parameters (s/ff0, grid, iterations, MC, noise fitting) are read **only for dataset 0**;
@@ -50,7 +57,7 @@ Repos affected: `us3lims_gridctl` (scheduler/submit), `us3lims_dbinst` (LIMS for
 | L2 | No per-triple parameters; `band_volume` always the default `0.015` (`submitone.php` `$defaults_2dsa`). |
 | L3 | **Probable bug:** `submitone.php` always uses `channel_parms[0]`; per-channel s/ff0 settings of other channels are ignored. |
 | L4 | Inputs are implicit ("latest edit + latest noise", `queue_setup_2.php`). Safe for a linear chain, **racy** once stages run in parallel (e.g. a global IT writes new noise while a per-triple MC is being submitted). |
-| L5 | `update_autoflow_models()` inserts `autoflowID=$autoflowID` unquoted → SQL error if `autoflowID` is NULL (standalone rows). |
+| L5 | `update_autoflow_models()` inserts `autoflowID=$autoflowID` unquoted → SQL error if the value is NULL/empty. |
 | L6 | Analysis profile (`aprofileGUID`) is mandatory in `submitone.php`. |
 
 ---
@@ -103,8 +110,11 @@ Principles:
 | `pipelineID` | INT NULL | NULL ⇒ legacy GMP row |
 | `rowKind` | ENUM(`triple`,`group`) DEFAULT `triple` | |
 | `groupName` | VARCHAR(80) NULL | for `rowKind=group` |
-| `autoflowID` | must allow NULL | standalone rows (fix L5) |
-| `aprofileGUID` | must allow NULL | standalone rows (fix L6) |
+
+`autoflowID`, `aprofileGUID`, `tripleName`, `filename` stay `NOT NULL` (no change to GMP semantics). Standalone
+rows use sentinels: `autoflowID = 0` (autoflow IDs start at 1, so GMP queries never match),
+`aprofileGUID = '00000000-0000-0000-0000-000000000000'`. The discriminator is `pipelineID IS NOT NULL`.
+The same sentinel is used for `autoflowModelsLink.autoflowID`.
 
 For `rowKind=group`, `tripleName`/`filename` hold the group name / run filename of the first member
 (informational only); members are listed in `statusJson.members`.
@@ -346,15 +356,48 @@ To verify against the schema: noise ↔ editedData linkage for global fits (one 
 |------|--------|
 | `submitctl.php` | v2 branch (§6.3); per-pipeline transaction; failure propagation; history per pipeline. v1 path untouched. |
 | `submitone.php` | v2: parameters from `statusJson.stages[id].params` (no XML); `grid.type=custom` → 2DSA-CG; PCSA solute-type mapping reused; multi-dataset + advanced-review submission for groups (§7.2); input pinning (§8); interactive stages → `WAIT`. |
-| `jobmonitor/cleanup_gfac.php` | handle `autoflowID IS NULL` (L5); key model links by `submitted_id`; store outputs into stage. |
+| `jobmonitor/cleanup_gfac.php` | quote `autoflowID` and accept sentinel 0 (L5); key model links by `submitted_id`; store outputs into stage. |
 | `jobmonitor/gridctl.php` | none expected (status update by `requestID`+`currentGfacID` is row-level). |
 | new `autoflow_util/pipeline_lib.php` | shared: spec validation (V1–V7), expansion spec → rows, parameter resolution, readiness. Used by submitctl, submitone, and the LIMS page. |
 
-### 9.2 DB schema repo
+### 9.2 `us3_sql`
 
-`analysisPipeline` table; columns §4.2; stored procedures `new_analysis_pipeline`, `get_analysis_pipeline`,
-`update_analysis_pipeline_stage` (revision-checked), `cancel_analysis_pipeline`; NULL-able `autoflowID`,
-`aprofileGUID`.
+* `us3.sql`: `CREATE TABLE analysisPipeline` (§4.1) and the three columns of §4.2 in **both**
+  `autoflowAnalysis` and `autoflowAnalysisHistory` (the history move is `INSERT … SELECT *`, so column lists
+  must stay identical), index `(pipelineID)`.
+* New upgrade script for existing instances (repo has none yet), e.g. `upgrades/2026-analysis_pipeline.sql`:
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS analysisPipeline (
+    pipelineID     int(11)      NOT NULL AUTO_INCREMENT,
+    name           varchar(255) NOT NULL,
+    invID          int(11)      NOT NULL,
+    clusterDefault text         DEFAULT "localhost",
+    specJson       json,
+    status         enum('ACTIVE','FINISHED','FAILED','CANCELED') DEFAULT 'ACTIVE',
+    createTime     timestamp    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updateTime     timestamp    DEFAULT 0 ON UPDATE CURRENT_TIMESTAMP,
+    createUser     varchar(128) DEFAULT (current_user()),
+    updateUser     varchar(128) DEFAULT "",
+    PRIMARY KEY (pipelineID),
+    KEY (invID)
+  ) ENGINE=InnoDB;
+
+  ALTER TABLE autoflowAnalysis
+    ADD COLUMN pipelineID int(11) DEFAULT NULL,
+    ADD COLUMN rowKind    enum('triple','group') NOT NULL DEFAULT 'triple',
+    ADD COLUMN groupName  varchar(80) DEFAULT NULL,
+    ADD KEY (pipelineID);
+  -- identical ALTER for autoflowAnalysisHistory
+  ```
+
+  Columns are appended at the end so existing positional `SELECT *` copies and readers keep working.
+* `us3_autoflow_procs.sql` (or new `us3_pipeline_procs.sql`, sourced from `us3_procedures.sql`):
+  `new_analysis_pipeline()` (creates pipeline + all rows in one transaction, returns `pipelineID`),
+  `new_analysis_pipeline_row()`, `get_analysis_pipeline()`, `get_analysis_pipeline_rows()`,
+  `update_analysis_pipeline_row_json(requestID, revision, json)` (revision-checked, §6.5),
+  `cancel_analysis_pipeline()`. All with `verify_user` and owner check (`invID`), like the existing procedures.
+  Existing `read_autoflowAnalysis_record` is unchanged.
 
 ### 9.3 `ultrascan3` (client)
 
@@ -381,7 +424,7 @@ Optional web page (`pipeline_setup.php`, `pipeline_viewer.php`) for users withou
 
 * v1 rows (`statusJson` without `version`) follow the existing code path; GMP GUI and reporter are unaffected.
 * `statusJson.submitted` keeps the method string, so `get_autoflow_type_id()` and existing consumers work.
-* v2 rows have `pipelineID IS NOT NULL`; GMP tools filter on `autoflowID` and will not see them.
+* v2 rows have `pipelineID IS NOT NULL` and `autoflowID = 0`; GMP tools select by `autoflowID` and will not see them.
 
 ---
 
@@ -389,7 +432,7 @@ Optional web page (`pipeline_setup.php`, `pipeline_viewer.php`) for users withou
 
 | phase | content | repos |
 |-------|---------|-------|
-| P0 | Schema: `analysisPipeline`, new columns, procedures | DB schema |
+| P0 | Schema: `analysisPipeline`, new columns, upgrade script, procedures | us3_sql |
 | P1 | `pipeline_lib.php` (validation, expansion, resolution) + unit tests (CLI, fixtures) | gridctl |
 | P2 | `submitctl.php` v2 scheduler, per-triple stages only (no groups) | gridctl |
 | P3 | `submitone.php` v2 params, custom grid, PCSA, input pinning | gridctl |
