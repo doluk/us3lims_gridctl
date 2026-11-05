@@ -126,7 +126,7 @@ member results); only then are they moved to history (§6.4).
 
 Parameter keys are the **LIMS form keys** already used in `submitone.php` (`s_value_min`, `ff0_max`,
 `s_grid_points`, `band_volume-value`, `mc_iterations`, `max_iterations`, …) plus a few structured keys
-(`noise`, `custom_grid`, `pcsa_solute_type`, `meniscus_*`). This removes the XML→form conversion tables
+(`noise`, `grid`, `pcsa_solute_type`). This removes the XML→form conversion tables
 for standalone rows.
 
 ```json
@@ -140,10 +140,7 @@ for standalone rows.
     "simpoints-value": 200, "band_volume-value": 0.015
   },
   "stages": [                                   // stage template, applied to every triple
-    {"id": "fm",  "method": "2DSA_FM", "enabled": false,
-     "params": {"noise": "ti+ri", "meniscus_range": 0.03, "meniscus_points": 11, "fit_mb_select": 1}},
-    {"id": "fit", "method": "FITMEN_AUTO", "enabled": false, "after": ["fm"]},
-    {"id": "it",  "method": "2DSA_IT", "enabled": true, "after": ["fit"],
+    {"id": "it",  "method": "2DSA_IT", "enabled": true,
      "params": {"noise": "ti+ri", "max_iterations": 10}},
     {"id": "mc",  "method": "2DSA_MC", "enabled": true, "after": ["it"],
      "params": {"mc_iterations": 100}, "inputs": {"noise_from": "it"}},
@@ -200,7 +197,7 @@ user.
 ```
 
 Stage `state`: `PENDING` → `READY` → `SUBMITTED` → (`RUNNING` …) → `COMPLETE` | `FAILED` | `CANCELED` |
-`SKIPPED` (disabled) | `BLOCKED` (predecessor failed / member failed) | `WAIT` (interactive).
+`SKIPPED` (disabled) | `BLOCKED` (predecessor failed / member failed).
 
 ---
 
@@ -209,8 +206,6 @@ Stage `state`: `PENDING` → `READY` → `SUBMITTED` → (`RUNNING` …) → `CO
 | method | scope | LIMS form | separate_datasets | role | default noise input |
 |--------|-------|-----------|-------------------|------|---------------------|
 | `2DSA` | triple | 2DSA_1 / 2DSA-CG_1 | 1 | conditioning | none (fits noise) |
-| `2DSA_FM` | triple | 2DSA_1 (fit_mb_select) | 1 | conditioning | none |
-| `FITMEN` / `FITMEN_AUTO` | triple | interactive / auto meniscus | – | conditioning (writes edit) | – |
 | `2DSA_IT` | triple | 2DSA_1 / 2DSA-CG_1 (iterations) | 1 | conditioning | none (fits noise) |
 | `2DSA_MC` | triple | 2DSA_1 / 2DSA-CG_1 (mc_iterations) | 1 | consumer | `it` |
 | `PCSA` | triple | PCSA_1 | 1 | consumer | last conditioning |
@@ -218,6 +213,11 @@ Stage `state`: `PENDING` → `READY` → `SUBMITTED` → (`RUNNING` …) → `CO
 | `2DSA_GL`, `2DSA_GL_IT` | group | 2DSA_1 / 2DSA-CG_1 | 0 | consumer (group) | member:last conditioning |
 | `2DSA_GL_MC` | group | 2DSA_1 / 2DSA-CG_1 | 0 | consumer (group) | member:last conditioning |
 | `PCSA_GL`, `PCSA_GL_MC` | group | PCSA_1 | 0 | consumer (group) | member:last conditioning |
+
+**Meniscus/bottom fitting is not part of the pipeline.** It is done manually beforehand (2DSA-FM job +
+`us_fit_meniscus`); the pipeline starts from the edit selected in Queue Setup, which carries the fitted
+meniscus. Consequently no pipeline stage changes the edit, and no interactive (`WAIT`) stage exists.
+`fit_mb_select` is forced to 0 for all pipeline stages.
 
 Custom grid is **not** a separate method: `params.grid.type = "custom"` selects `2DSA-CG_1/2.php` and
 sets `CG_modelID` (R5). It can be set in the template, per stage, per triple or per group.
@@ -234,7 +234,7 @@ determines scope and default iteration/MC settings.
 | V | rule |
 |---|------|
 | V1 | Graph (in-row `after` + cross-row `waitFor` + implicit edges from `inputs`) is acyclic. |
-| V2 | **Conditioning stages are totally ordered** in canonical order `2DSA < 2DSA_FM < FITMEN* < 2DSA_IT` (each may change meniscus or noise). Disabled ones are skipped; edges are re-linked to the previous enabled stage. |
+| V2 | **Conditioning stages are totally ordered** in canonical order `2DSA < 2DSA_IT` (each fits noise). Disabled ones are skipped; edges are re-linked to the previous enabled stage. |
 | V3 | Every **consumer** stage depends on the last enabled conditioning stage of its triple (implicit edge). Consumers have no mandatory order among each other; the user order (`order`) only serialises them in the row. |
 | V4 | A group stage `waitFor.member_stage` must reference a stage enabled in **every** member (after triple overrides); otherwise creation is rejected. |
 | V5 | `inputs.noise_from` must reference a predecessor (direct or transitive); it adds an implicit edge. |
@@ -252,7 +252,7 @@ stage s in row r is READY iff
 and s.state == PENDING
 and ∀ p ∈ s.after          : r.stages[p].state ∈ {COMPLETE, SKIPPED}
 and (r.kind == group ⇒ ∀ m ∈ r.members : m.stages[s.waitFor.member_stage].state == COMPLETE)
-and r has no stage in {SUBMITTED, RUNNING, WAIT}        # one job per row
+and r has no stage in {SUBMITTED, RUNNING}              # one job per row
 ```
 
 Among several READY stages of a row, the first in `order` is submitted.
@@ -331,9 +331,7 @@ At READY time `submitctl` (or `submitone`, before including the LIMS forms) reso
 
 * Stages without a predecessor use the edit and noise the user selected in Queue Setup
   (`spec.requests`, §9.3).
-* `editedDataID`: for triples, the latest edit of the triple **after** the last conditioning stage
-  (FITMEN may write a new meniscus); for groups, each member's pinned `editedDataID` of its
-  `waitFor.member_stage`.
+* `editedDataID`: constant for the whole pipeline (no stage writes an edit); always the Queue Setup choice.
 * `noiseIDs`: outputs of the stage named in `inputs.noise_from`, looked up via
   `HPCAnalysisResultData (HPCAnalysisResultID → HPCAnalysisResultType='noise', resultID)` for the stage's
   `HPCAnalysisRequestID`, filtered by the dataset's `editedDataID`. `none` ⇒ no noise subtracted.
@@ -357,7 +355,7 @@ To verify against the schema: noise ↔ editedData linkage for global fits (one 
 | file | change |
 |------|--------|
 | `submitctl.php` | v2 branch (§6.3); per-pipeline transaction; failure propagation; history per pipeline. v1 path untouched. |
-| `submitone.php` | v2: parameters from `statusJson.stages[id].params` (no XML); `grid.type=custom` → 2DSA-CG; PCSA solute-type mapping reused; multi-dataset + advanced-review submission for groups (§7.2); input pinning (§8); interactive stages → `WAIT`. |
+| `submitone.php` | v2: parameters from `statusJson.stages[id].params` (no XML); `grid.type=custom` → 2DSA-CG; PCSA solute-type mapping reused; multi-dataset + advanced-review submission for groups (§7.2); input pinning (§8); `fit_mb_select = 0`. |
 | `jobmonitor/cleanup_gfac.php` | quote `autoflowID` and accept sentinel 0 (L5); key model links by `submitted_id`; store outputs into stage. |
 | `jobmonitor/gridctl.php` | none expected (status update by `requestID`+`currentGfacID` is row-level). |
 | new `autoflow_util/pipeline_lib.php` | shared: spec validation (V1–V7), expansion spec → rows, parameter resolution, readiness. Used by submitctl, submitone, and the LIMS page. |
@@ -403,7 +401,7 @@ To verify against the schema: noise ↔ editedData linkage for global fits (one 
 
 ### 9.3 `us3lims_dbinst` (user interface)
 
-The pipeline is a **fourth way to submit from Queue Setup**, next to "separate / global / composite":
+Available to **all users** (no `advancelevel` restriction). The pipeline is a **fourth way to submit from Queue Setup**, next to "separate / global / composite":
 
 ```
 queue_setup_1.php  select datasets (unchanged)
@@ -415,12 +413,12 @@ queue_viewer.php   + link per pipeline                           → pipeline_vi
 
 **`pipeline_setup.php`** (new; reuses the widgets in `lib/controls.php`, e.g. `s_grid_points()`,
 `ff0_grid_points()`, `CG_select_setup()`, `uniform_grid_setup()`, `iterations_option()`, `montecarlo()`,
-`band_volume_input()`, `simpoints_input()`, `fit_menibott()`, `pcsa_pars_setup()`):
+`band_volume_input()`, `simpoints_input()`, `pcsa_pars_setup()`):
 
 | section | content |
 |---------|---------|
-| Shared parameters | s / ff0 limits and grid points, grid type (uniform or custom grid via `CG_select_setup`), simpoints, band volume, radial/time grid, cluster (from `$_SESSION['clusterAuth']`, same list as `2DSA_1.php`). |
-| Stages | one row per method of §5: enable checkbox, per-stage parameters (noise, iterations, MC iterations, meniscus range/points, PCSA curve options), ▲▼ for consumer stages; conditioning stages shown in fixed order. |
+| Shared parameters | s / ff0 limits and grid points, grid type (uniform or custom grid via `CG_select_setup`), simpoints, band volume, radial/time grid, cluster (from `$_SESSION['clusterAuth']`, same list as `2DSA_1.php`; **one cluster for all stages of the pipeline**, stored in `analysisPipeline.clusterDefault` and every row's `clusterDefault`). |
+| Stages | one row per method of §5: enable checkbox, per-stage parameters (noise, iterations, MC iterations, PCSA curve options), ▲▼ for consumer stages; conditioning stages shown in fixed order. |
 | Datasets | one row per `$_SESSION['request'][i]` (edit + noise as chosen in Queue Setup); columns = overridable parameters, empty = inherit (placeholder shows inherited value); per-dataset stage enable checkboxes; "apply to selected rows". |
 | Groups | create named groups from a multi-select of datasets; per group: stages (`2DSA_GL_IT`, `2DSA_GL_MC`, `PCSA_GL`, …), job-level parameters, `waitFor` stage, failure policy. |
 | Summary | expanded stage graph per dataset/group, validation messages (V1–V7), estimated number of cluster jobs. |
@@ -477,15 +475,23 @@ P1–P3 give R1, R3, R4, R5 for single triples; P4 adds R2.
 
 ---
 
-## 12. Open questions
+## 12. Decisions
 
-1. **FITMEN in LIMS pipelines**: only `FITMEN_AUTO`, or also interactive (row → `WAIT`; user runs
-   `us_fit_meniscus` in the desktop client and releases the stage in `pipeline_viewer.php`)?
-2. **Consumer parallelism per triple**: proposed one job per row (consumers of a triple run sequentially in
-   user order). Need true parallel MC + PCSA on the same triple? (would require one row per stage).
-3. **Group failure default**: `block` (proposed) or `drop_member`?
-4. **Global noise**: should a later per-triple stage be allowed to use noise from a group stage
-   (`noise_from: "group:G1/glit"`)? Adds triple→group edges; allowed by V1 if acyclic.
-5. **Advance level**: offer the pipeline to all users or only above a given `advancelevel` (like some controls in `queue_setup_3.php`)?
-6. **Ownership/permissions**: pipeline visible to owner only, or to all users with access to the run?
-7. **Cluster per stage** (e.g. MC on a larger cluster): add `cluster` as a stage parameter?
+| # | decision |
+|---|----------|
+| D1 | Entry point: LIMS Queue Setup (`us3lims_dbinst`), no desktop program. |
+| D2 | Global groups are user-defined. |
+| D3 | Every parameter can be overridden per dataset (and per group for group stages, §7.2). |
+| D4 | Meniscus/bottom fit stays manual, outside the pipeline (no `2DSA_FM`, `FITMEN`). |
+| D5 | Pipeline setup is available to all users. |
+| D6 | One cluster for the whole pipeline. |
+
+## 13. Open questions
+
+1. **Consumer parallelism per dataset**: proposed one job per row (consumers of a dataset run sequentially in
+   user order). Need true parallel MC + PCSA on the same dataset? (would require one row per stage).
+2. **Group failure default**: `block` (proposed) or `drop_member`?
+3. **Global noise**: should a later per-dataset stage be allowed to use noise from a group stage
+   (`noise_from: "group:G1/glit"`)? Adds dataset→group edges; allowed by V1 if acyclic.
+4. **Viewer permissions**: proposed the same rule as `queue_viewer.php` (`is_authorized()`: owner, plus admins
+   by `userlevel`).
