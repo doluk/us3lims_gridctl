@@ -1,8 +1,8 @@
 # Flexible Analysis Pipeline (non-GMP) — Design
 
 Status: **draft for review** — no code changes yet.
-Repos affected: `us3lims_gridctl` (scheduler/submit), `us3lims_dbinst` (LIMS forms, minor),
-`ultrascan3` (client GUI), `us3_sql` (tables / stored procedures).
+Repos affected: `us3lims_gridctl` (scheduler/submit), `us3lims_dbinst` (user interface: pipeline setup in Queue Setup, pipeline viewer),
+`us3_sql` (tables / stored procedures). `ultrascan3` is not affected.
 
 ---
 
@@ -15,7 +15,7 @@ Repos affected: `us3lims_gridctl` (scheduler/submit), `us3lims_dbinst` (LIMS for
 | R3 | Each stage can be enabled/disabled and configured individually; order is user-defined within logical constraints (conditioning stages first; consumer stages in any order). |
 | R4 | Shared parameter template (s/ff0 limits, grid points, grid type, noise, iterations, …); **any** parameter can be overridden per triple (e.g. band volume). |
 | R5 | Support PCSA and custom grids (2DSA-CG). |
-| R6 | **Standalone** entry point for already-edited data, independent of the GMP autoflow chain (no protocol, no report). Reuse the existing engine (`submitctl.php` / `submitone.php` / `gridctl` / `cleanup_gfac`). GMP behaviour must not change. |
+| R6 | Entry point is the **LIMS job submission** (`us3lims_dbinst`: Queue Setup → method page), for already-edited data, independent of the GMP autoflow chain (no protocol, no report). Reuse the existing engine (`submitctl.php` / `submitone.php` / `gridctl` / `cleanup_gfac`). GMP behaviour must not change. |
 
 ---
 
@@ -229,7 +229,7 @@ determines scope and default iteration/MC settings.
 
 ## 6. Dependency model and scheduler
 
-### 6.1 Validation rules (client + `submitctl` on load)
+### 6.1 Validation rules (LIMS page on submit + `submitctl` on load)
 
 | V | rule |
 |---|------|
@@ -239,7 +239,7 @@ determines scope and default iteration/MC settings.
 | V4 | A group stage `waitFor.member_stage` must reference a stage enabled in **every** member (after triple overrides); otherwise creation is rejected. |
 | V5 | `inputs.noise_from` must reference a predecessor (direct or transitive); it adds an implicit edge. |
 | V6 | A triple may be a member of several groups; a group needs ≥ 2 members. |
-| V7 | Group job-level parameters come from the group (§7.2); member job-level overrides are ignored for group stages and the client warns about them. |
+| V7 | Group job-level parameters come from the group (§7.2); member job-level overrides are ignored for group stages and the setup page warns about them. |
 
 The user's example satisfies these rules: `2DSA_IT` (conditioning) precedes everything; `2DSA_MC`, `PCSA`,
 `2DSA_GL_IT`, `2DSA_GL_MC` are consumers whose relative order is free.
@@ -281,9 +281,9 @@ group; therefore v2 rows move to history **per pipeline**, not per row.
 
 ### 6.5 Runtime edits
 
-The client may toggle `enabled`, change `params`, `order` and `after` of stages in state `PENDING` only.
+The LIMS pipeline viewer may toggle `enabled`, change `params`, `order` and `after` of stages in state `PENDING` only.
 Writes use `UPDATE … WHERE requestID=? AND JSON_EXTRACT(statusJson,'$.revision')=?` and increment
-`revision`; the scheduler does the same. Conflicts are retried by the client.
+`revision`; the scheduler does the same. Conflicts are reported to the user (reload).
 
 Cancel: stage → `CANCELED` (running job: existing `scancel` path); successors → `BLOCKED`.
 Retry: `FAILED`/`BLOCKED` → `PENDING` (successors reset to `PENDING`).
@@ -329,6 +329,8 @@ Unchanged; v1 rows keep reading the profile XML. Optionally (separate change) fi
 
 At READY time `submitctl` (or `submitone`, before including the LIMS forms) resolves:
 
+* Stages without a predecessor use the edit and noise the user selected in Queue Setup
+  (`spec.requests`, §9.3).
 * `editedDataID`: for triples, the latest edit of the triple **after** the last conditioning stage
   (FITMEN may write a new meniscus); for groups, each member's pinned `editedDataID` of its
   `waitFor.member_stage`.
@@ -399,24 +401,54 @@ To verify against the schema: noise ↔ editedData linkage for global fits (one 
   `cancel_analysis_pipeline()`. All with `verify_user` and owner check (`invID`), like the existing procedures.
   Existing `read_autoflowAnalysis_record` is unchanged.
 
-### 9.3 `ultrascan3` (client)
+### 9.3 `us3lims_dbinst` (user interface)
 
-New program `us_analysis_pipeline` (or a mode of `us_analysis_profile` / `us_autoflow_analysis`):
+The pipeline is a **fourth way to submit from Queue Setup**, next to "separate / global / composite":
 
-* **Data**: select run(s) → triples with their latest edits (existing `US_DataLoader`).
-* **Template tab**: stage list (checkbox, method, up/down for consumers; conditioning stages fixed order),
-  shared parameters, grid type incl. custom-grid model picker, PCSA options.
-* **Triples tab**: table triple × parameter; empty cell = inherit, edited cell = override (bold);
-  per-triple stage enable matrix.
-* **Groups tab**: create groups by multi-select; group parameters; group stages + `waitFor`.
-* **Monitor**: tree pipeline → rows → stages with state, cluster job, msg; actions enable/disable/retry/cancel
-  for PENDING/FAILED stages (revision-checked writes). Reuse widgets from `us_autoflow_analysis`.
-* Validation (V1–V7) mirrored client-side for immediate feedback; server remains authoritative.
+```
+queue_setup_1.php  select datasets (unchanged)
+queue_setup_2.php  edit profile + noise per dataset (unchanged)  → $_SESSION['request'][i]
+queue_setup_3.php  + button "Setup Analysis Pipeline"            → pipeline_setup.php
+pipeline_setup.php configure, validate, "Submit Pipeline"        → analysisPipeline + autoflowAnalysis rows
+queue_viewer.php   + link per pipeline                           → pipeline_viewer.php
+```
 
-### 9.4 `us3lims_dbinst`
+**`pipeline_setup.php`** (new; reuses the widgets in `lib/controls.php`, e.g. `s_grid_points()`,
+`ff0_grid_points()`, `CG_select_setup()`, `uniform_grid_setup()`, `iterations_option()`, `montecarlo()`,
+`band_volume_input()`, `simpoints_input()`, `fit_menibott()`, `pcsa_pars_setup()`):
 
-Optional web page (`pipeline_setup.php`, `pipeline_viewer.php`) for users without the desktop client, using
-`pipeline_lib.php`. No change to existing 2DSA/PCSA forms required.
+| section | content |
+|---------|---------|
+| Shared parameters | s / ff0 limits and grid points, grid type (uniform or custom grid via `CG_select_setup`), simpoints, band volume, radial/time grid, cluster (from `$_SESSION['clusterAuth']`, same list as `2DSA_1.php`). |
+| Stages | one row per method of §5: enable checkbox, per-stage parameters (noise, iterations, MC iterations, meniscus range/points, PCSA curve options), ▲▼ for consumer stages; conditioning stages shown in fixed order. |
+| Datasets | one row per `$_SESSION['request'][i]` (edit + noise as chosen in Queue Setup); columns = overridable parameters, empty = inherit (placeholder shows inherited value); per-dataset stage enable checkboxes; "apply to selected rows". |
+| Groups | create named groups from a multi-select of datasets; per group: stages (`2DSA_GL_IT`, `2DSA_GL_MC`, `PCSA_GL`, …), job-level parameters, `waitFor` stage, failure policy. |
+| Summary | expanded stage graph per dataset/group, validation messages (V1–V7), estimated number of cluster jobs. |
+
+Server-side validation uses `pipeline_lib.php` (shared with gridctl, §9.1); a JS copy only gives immediate
+feedback. The page writes `analysisPipeline` and the rows (direct SQL with the LIMS `$link`, like the other
+dbinst pages, or the procedures of §9.2) in one transaction and does **not** submit a job itself; `submitctl`
+picks up the READY rows on its next poll.
+
+What the LIMS session provides and the spec stores, so that `submitone.php` no longer has to fake it:
+
+* `requests`: the `$_SESSION['request']` entries (`rawDataID`, `editedDataID`, `noiseIDs`, `path`,
+  `filename`, `editFilename`, `editMeniscus`, `dataLeft`, `dataRight`). `submitone.php` restores
+  `$_SESSION['request']` from this instead of re-running `queue_setup_1/2.php` (which would pick the
+  *latest* edit/noise, not the user's choice).
+* `submitter`: `personID`, `email`, `submitter_email`, `userlevel`, `advancelevel`, `clusterAuth`, `gwhostid`.
+  Currently `submitone.php` overrides `userlevel = 2` and the e-mail with `us3-admin@…`; for LIMS pipelines
+  the stored values are used (notification mails reach the user).
+
+**`pipeline_viewer.php`** (new; linked from `queue_viewer.php`, same authorisation as `is_authorized()`):
+tree pipeline → dataset/group rows → stages with state, HPC request, cluster job, message, result links
+(model/noise). Actions on PENDING/FAILED/BLOCKED stages: enable/disable, edit parameters, retry, cancel;
+"Cancel pipeline" uses the existing cancel path for the running job.
+
+### 9.4 `ultrascan3`
+
+No change required. Results appear as ordinary models/noises of the edits and are loaded with the existing
+programs (e.g. `us_fematch`, `us_pseudo3d_combine`).
 
 ---
 
@@ -438,8 +470,8 @@ Optional web page (`pipeline_setup.php`, `pipeline_viewer.php`) for users withou
 | P3 | `submitone.php` v2 params, custom grid, PCSA, input pinning | gridctl |
 | P4 | Groups: multi-dataset advanced-review submission, waitFor, failure policy | gridctl (+ dbinst if form fixes needed) |
 | P5 | `cleanup_gfac.php` NULL autoflowID, outputs per stage | gridctl |
-| P6 | Client GUI setup + monitor | ultrascan3 |
-| P7 | Optional LIMS web pages; fix L3 for GMP | dbinst, gridctl |
+| P6 | `pipeline_setup.php` (from queue_setup_3) + `pipeline_viewer.php` (from queue_viewer) | dbinst |
+| P7 | Fix L3 for GMP rows | gridctl |
 
 P1–P3 give R1, R3, R4, R5 for single triples; P4 adds R2.
 
@@ -447,13 +479,13 @@ P1–P3 give R1, R3, R4, R5 for single triples; P4 adds R2.
 
 ## 12. Open questions
 
-1. **FITMEN in standalone pipelines**: only `FITMEN_AUTO`, or also interactive (row → `WAIT`, client launches
-   `us_fit_meniscus` and clears the wait)?
+1. **FITMEN in LIMS pipelines**: only `FITMEN_AUTO`, or also interactive (row → `WAIT`; user runs
+   `us_fit_meniscus` in the desktop client and releases the stage in `pipeline_viewer.php`)?
 2. **Consumer parallelism per triple**: proposed one job per row (consumers of a triple run sequentially in
    user order). Need true parallel MC + PCSA on the same triple? (would require one row per stage).
 3. **Group failure default**: `block` (proposed) or `drop_member`?
 4. **Global noise**: should a later per-triple stage be allowed to use noise from a group stage
    (`noise_from: "group:G1/glit"`)? Adds triple→group edges; allowed by V1 if acyclic.
-5. **Client**: new standalone program vs. extending `us_analysis_profile`; desktop only or also LIMS web page?
+5. **Advance level**: offer the pipeline to all users or only above a given `advancelevel` (like some controls in `queue_setup_3.php`)?
 6. **Ownership/permissions**: pipeline visible to owner only, or to all users with access to the run?
 7. **Cluster per stage** (e.g. MC on a larger cluster): add `cluster` as a stage parameter?
