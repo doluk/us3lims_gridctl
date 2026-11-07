@@ -457,9 +457,9 @@ programs (e.g. `us_fematch`, `us_pseudo3d_combine`).
 | phase | content | repos |
 |-------|---------|-------|
 | P0 | Schema: `analysisPipeline`, new columns, upgrade script (**done**) | us3_sql |
-| P1 | `pipeline_lib.php` (validation, expansion, resolution) + unit tests (CLI, fixtures) | gridctl |
-| P2 | `submitctl.php` pipeline loop, dataset stages only (no groups) | gridctl |
-| P3 | `submitone.php` v2 params, custom grid, PCSA, input pinning | gridctl |
+| P1 | `pipeline_lib.php` (validation, expansion, resolution) + unit tests (CLI, fixtures) (**done**) | gridctl |
+| P2 | `submitctl.php` pipeline loop (scheduling incl. group readiness) (**done**) | gridctl |
+| P3 | `submitone.php` v2 params, custom grid, PCSA, input pinning — dataset stages (**done**; group rows fail with "can not be submitted yet") | gridctl |
 | P4 | Groups: multi-dataset advanced-review submission, member predecessors, blocking | gridctl (+ dbinst if form fixes needed) |
 | P5 | `cleanup_gfac.php` sentinel autoflowID, outputs per row | gridctl |
 | P6 | `pipeline_setup.php` (from queue_setup_3) + `pipeline_viewer.php` (from queue_viewer) | dbinst |
@@ -484,7 +484,30 @@ P1–P3 give R1, R3, R4, R5 for single datasets; P4 adds R2.
 | D9 | Global fits do not fit noise (current LIMS limitation); the noise source of every successor is chosen by the user (§6.1 V5). |
 | D10 | Viewer authorisation as in `queue_viewer.php` (`is_authorized()`). |
 
-## 13. Open questions
+## 13. Implementation notes (P1–P3)
 
-None blocking. To verify during implementation: noise ↔ editedData mapping of HPC results (§8), and the CLI
-behaviour of the advanced-review path for group submissions (§7.2).
+* **Code**: `autoflow_util/pipeline_lib.php` (pure validation/expansion/resolution/POST builder/transitions +
+  DB layer `pl_create_pipeline()`, `pl_scheduler_pass()`); `submitctl.php` calls `pl_scheduler_pass()` per LIMS
+  DB before the GMP loop; `submitone.php` branches on `pipelineID` (`submit_pipeline_prepare()`), the LIMS page
+  is included at top level as in the GMP path.
+* **Tests**: `php autoflow_util/tests/pipeline_lib_test.php` (pure functions);
+  `php autoflow_util/tests/pipeline_db_test.php <us3_sql>/us3.sql` (scheduler against a scratch MariaDB database,
+  simulating `submit_local`/`gridctl`/`cleanup_gfac`; also passes with mysqli exception mode,
+  `PL_TEST_STRICT=1`).
+* **Safety for GMP rows**: the GMP loop filters `pipelineID IS NULL` whenever the column exists, independent of
+  whether `pipeline_lib.php` could be loaded. Databases without the upgrade behave exactly as before.
+* **Status mapping**: `COMPLETE`/`DONE` → outputs recorded → `FINISHED`; `FAILED`, `ERROR`, `SUBMIT_TIMEOUT`,
+  `RUN_TIMEOUT`, `DATA_TIMEOUT`, `FAILED_DATA` → `FAILED` (original status kept as message prefix, cluster job
+  cancelled with `scancel` as for GMP rows); `CANCELED` stays `CANCELED`.
+* **Method semantics**: `*_IT` sets `iterations_option=1`; `*_MC` requires `mc_iterations > 1`, other methods
+  force `mc_iterations=1` (validation error if set > 1); noise fitting via `noise_fit` (`none|ti|ri|ti+ri`).
+* **Noise from MC stages**: if a source stage produced several noise records of one type for an edit, the latest
+  (highest `noiseID`) is used.
+* **Session**: e-mail and user level of the submitting user from the spec (no `us3-admin` override); cluster
+  authorisations read from `people` at submit time. The LIMS pages require `userlevel >= 2`.
+* **Known gap**: a row stays `READY` if `submitone.php` dies before `submit_local.php` updates it (same as GMP).
+
+## 14. Open questions
+
+None blocking. Noise ↔ edit mapping is resolved (`noise.editedDataID`, `model.editedDataID`). Still to verify in P4:
+the CLI behaviour of the LIMS advanced-review path for group submissions (§7.2).

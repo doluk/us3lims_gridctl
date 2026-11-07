@@ -193,6 +193,30 @@ write_logl( "connected to mysql: $dbhost, $user, $db.", 2 );
 
 # get AutoflowAnalysis record
 
+# analysis pipeline rows (pipelineID set) take their own path, see submit_pipeline_row()
+$pipelineID = 0;
+try {
+    $result = mysqli_query( $db_handle, "SELECT pipelineID FROM ${lims_db}.${submit_request_table_name} WHERE ${id_field}=$ID" );
+    if ( $result && ( $obj = mysqli_fetch_object( $result ) ) ) {
+        $pipelineID = intval( $obj->pipelineID );
+    }
+} catch ( Exception $e ) {
+    # no pipelineID column: database without pipeline schema
+}
+if ( $pipelineID > 0 ) {
+    $pipeline_page = submit_pipeline_prepare( $pipelineID );
+    if ( $pipeline_page ) {
+        # included at top level: the LIMS pages rely on globals from config.php / db.php
+        ob_start( "dump_it" );
+        include( $pipeline_page );
+        while ( ob_get_level() ) ob_end_flush();
+        check_cli_errors_in_dump();
+        check_cli_errors();
+        write_logl( "pipeline $pipelineID row $ID submitted" );
+    }
+    exit;
+}
+
 $autoflowanalysis = db_obj_result( $db_handle, 
                                    "SELECT clusterDefault, tripleName, filename, invID, aprofileGUID, statusJson FROM ${lims_db}.${submit_request_table_name} WHERE ${id_field}=$ID" );
 
@@ -771,3 +795,117 @@ Post:
     "TIGRE": "Submit"
 }
 */
+
+## ************* analysis pipeline rows ***************
+## (doc/analysis_pipeline_design.md) parameters and inputs were resolved and
+## stored in statusJson by submitctl.php (pipeline_lib.php) when the row
+## became READY; this only builds $_SESSION / $_POST and calls the LIMS page.
+
+## same cluster resolution as the GMP path above
+function submit_pipeline_cluster_string( $cluster ) {
+    global $class_dir;
+    global $host_name;
+
+    $queue = "batch";
+    if ( $cluster == "localhost" ) {
+        $cluster = "us3iab-node0";
+    } else {
+        $global_config_file  = "$class_dir/../global_config.php";
+        try {
+            include( $global_config_file );
+        } catch ( Exception $e ) {
+            echo "ERROR: including $global_config_file " . $e->getMessage() . "\n";
+        }
+        if ( isset( $cluster_details )
+             && is_array( $cluster_details )
+             && array_key_exists( $cluster, $cluster_details )
+             && array_key_exists( 'name', $cluster_details[ $cluster ] ) ) {
+            $host_name = $cluster_details[ $cluster ][ 'name' ];
+            if ( array_key_exists( 'queue', $cluster_details[ $cluster ] ) ) {
+                $queue = $cluster_details[ $cluster ][ 'queue' ];
+            }
+        }
+    }
+    echo "cluster $cluster host_name $host_name queue $queue\n";
+    return "${host_name}:${cluster}:${queue}";
+}
+
+## prepares $_SESSION / $_POST for the LIMS method page and returns its path
+## (null if there is nothing to submit); exits via error() on failure
+function submit_pipeline_prepare( $pipelineID ) {
+    global $db_handle, $lims_db, $ID, $id_field, $submit_request_table_name;
+    global $www_uslims3, $host_name;
+
+    $lib = __DIR__ . "/autoflow_util/pipeline_lib.php";
+    if ( !file_exists( $lib ) ) {
+        $lib = __DIR__ . "/pipeline_lib.php";
+    }
+    if ( !file_exists( $lib ) ) {
+        error( "pipeline_lib.php not found" );
+    }
+    require_once $lib;
+
+    $row = db_obj_result( $db_handle,
+                          "SELECT status, clusterDefault, invID, rowKind, statusJson FROM ${lims_db}.${submit_request_table_name} WHERE ${id_field}=$ID" );
+    if ( strtoupper( $row->status ) != 'READY' ) {
+        write_logl( "pipeline row $ID is not READY (status {$row->status}), nothing to submit", 1 );
+        return null;
+    }
+    $sj = json_decode( $row->statusJson, true );
+    if ( !is_array( $sj ) || empty( $sj[ 'inputs' ] ) || !isset( $sj[ 'params' ] ) ) {
+        error( "pipeline row has no resolved params/inputs" );
+    }
+    if ( $row->rowKind == 'group' ) {
+        error( "global (group) stages can not be submitted yet" );
+    }
+
+    $pipeline = db_obj_result( $db_handle,
+                               "SELECT specJson FROM ${lims_db}.analysisPipeline WHERE pipelineID=$pipelineID" );
+    $spec = json_decode( $pipeline->specJson, true );
+    $personID = intval( $spec[ 'submitter' ][ 'personID' ] ?? $row->invID );
+    $person = db_obj_result( $db_handle, "SELECT * FROM ${lims_db}.people WHERE personID='$personID'" );
+    $submitter = $spec[ 'submitter' ] ?? [];
+
+    write_logl( "pipeline $pipelineID row $ID stage {$sj['stageKey']} method {$sj['method']}" );
+
+    $php_base = "${www_uslims3}/${lims_db}";
+    chdir( $php_base );
+    set_include_path( get_include_path() . PATH_SEPARATOR . $php_base );
+
+    $_SESSION = [];
+    $_SESSION[ 'id' ]               = $person->personID;
+    $_SESSION[ 'loginID' ]          = $person->personID;
+    $_SESSION[ 'firstname' ]        = $person->fname;
+    $_SESSION[ 'lastname' ]         = $person->lname;
+    $_SESSION[ 'phone' ]            = $person->phone;
+    # the submitting user, not an admin override: notifications reach the user
+    $_SESSION[ 'email' ]            = $submitter[ 'email' ] ?? $person->email;
+    $_SESSION[ 'submitter_email' ]  = $submitter[ 'submitter_email' ] ?? $_SESSION[ 'email' ];
+    $_SESSION[ 'userlevel' ]        = $submitter[ 'userlevel' ] ?? $person->userlevel;
+    $_SESSION[ 'advancelevel' ]     = $submitter[ 'advancelevel' ] ?? $person->advancelevel;
+    $_SESSION[ 'instance' ]         = $lims_db;
+    $_SESSION[ 'user_id' ]          = $person->fname . "_" . $person->lname . "_" . $person->personGUID;
+    # current authorizations from the people table (may have changed since the pipeline was created)
+    $_SESSION[ 'clusterAuth' ]      = explode( ":", $person->clusterAuthorizations );
+    $_SESSION[ 'gwhostid' ]         = $host_name;
+    $_SESSION[ 'separate_datasets' ] = 1;
+    $_SESSION[ 'request' ]          = [];
+    foreach ( $sj[ 'inputs' ][ 'datasets' ] as $input ) {
+        $_SESSION[ 'request' ][]    = pl_session_request( $spec, $input );
+    }
+
+    try {
+        $b = pl_build_post( $sj[ 'method' ], $sj[ 'params' ], submit_pipeline_cluster_string( $row->clusterDefault ) );
+    } catch ( Exception $e ) {
+        error( $e->getMessage() );
+    }
+    $_REQUEST = $b[ 'post' ];
+    $_POST    = $_REQUEST;
+
+    $page = "${php_base}/" . $b[ 'page' ];
+    echo "preparing to call $page\n";
+    echo "session now is:\n" . json_encode( $_SESSION, JSON_PRETTY_PRINT ) . "\n";
+    echo "request/post now is:\n" . json_encode( $_REQUEST, JSON_PRETTY_PRINT ) . "\n";
+    return $page;
+}
+

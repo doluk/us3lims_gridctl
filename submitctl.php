@@ -33,7 +33,21 @@ $processing_key                    = "submitted";
 $failed_status                     = [ "failed" => 1, "error" => 1, "canceled" => 1 ];
 $completed_status                  = [ "complete" => 1, "done" => 1 ];
 $wait_status                       = [ "wait" => 1 ];
+# analysis pipeline (autoflowAnalysis rows with pipelineID, see doc/analysis_pipeline_design.md)
+# $pipeline_max_active may be set in listen-config.php: max. stages per pipeline running at once (null = unlimited)
+if ( !isset( $pipeline_max_active ) ) {
+    $pipeline_max_active = null;
+}
 # ********* end admin defines ***************
+
+$pipeline_lib = __DIR__ . "/autoflow_util/pipeline_lib.php";
+if ( !file_exists( $pipeline_lib ) ) {
+    $pipeline_lib = __DIR__ . "/pipeline_lib.php";
+}
+$pipeline_lib_loaded = file_exists( $pipeline_lib );
+if ( $pipeline_lib_loaded ) {
+    require_once $pipeline_lib;
+}
 
 
 # add locking
@@ -170,6 +184,8 @@ while ( $obj =  mysqli_fetch_object( $result ) ) {
 }
 
 $limsdbs = [];
+$pipeline_dbs  = [];
+$pipeline_cols = [];
 
 foreach ( $trylimsdbs as $v ) {
     write_logls( "checking db $v for autoflow tables", 4 );
@@ -220,6 +236,25 @@ foreach ( $trylimsdbs as $v ) {
     if ( $success ) {
         write_logls( "added db $v for autoflow submission control", 1 );
         $limsdbs[] = $v;
+        # analysis pipeline schema present? (us3_sql upgrades/2026-11-analysis_pipeline.sql)
+        # $pipeline_cols: the GMP loop must skip pipeline rows whenever the column exists
+        # $pipeline_dbs:  pipeline rows are scheduled (schema complete and pipeline_lib.php loaded)
+        $query  = "SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$v' "
+                . "AND TABLE_NAME='${submit_request_table_name}' AND COLUMN_NAME='pipelineID'";
+        $result = mysqli_query( $db_handle, $query );
+        $pipeline_cols[ $v ] = $result && intval( mysqli_fetch_object( $result )->n ) > 0;
+        $pipeline_dbs[ $v ]  = false;
+        if ( $pipeline_cols[ $v ] && $pipeline_lib_loaded ) {
+            try {
+                $pipeline_dbs[ $v ] = pl_db_has_pipeline_schema( $db_handle, $v );
+            } catch ( Exception $e ) {
+                write_logls( "checking db $v for analysis pipeline schema failed: " . $e->getMessage() );
+            }
+        }
+        if ( $pipeline_cols[ $v ] && !$pipeline_dbs[ $v ] ) {
+            write_logls( "WARNING: db $v has pipeline columns but pipelines can not be scheduled (incomplete schema or missing pipeline_lib.php)" );
+        }
+        write_logls( "db $v analysis pipeline " . ( $pipeline_dbs[ $v ] ? "enabled" : "disabled" ), 1 );
     } else {
         write_logls( "ignoring db ${v}. reason: ${error}", 1 );
     }
@@ -239,9 +274,40 @@ while( 1 ) {
 
     foreach ( $limsdbs as $lims_db ) {
         write_logls( "checking mysql db ${lims_db}", 2 );
-        
+
+        # analysis pipelines: rows with pipelineID are scheduled by pipeline_lib.php
+        if ( $pipeline_dbs[ $lims_db ] ) {
+            try {
+                if ( pl_scheduler_pass( $db_handle, $lims_db, [
+                         'max_active' => $pipeline_max_active,
+                         'log'        => function( $msg, $level = 0 ) { write_logls( $msg, $level ); },
+                         'spawn'      => function( $ID ) use ( $home, $lims_db ) {
+                             $cmd = "php $home/bin/submitone.php $lims_db $ID >> $home/etc/submit.log 2>&1 &";
+                             write_logls( "running $cmd" );
+                             shell_exec( $cmd );
+                         },
+                         'scancel'    => function( $gfacID ) use ( $home ) {
+                             # only works for slurm (as for GMP rows)
+                             $cmd = "scancel " . escapeshellarg( $gfacID ) . " >> $home/etc/submit.log 2>&1 &";
+                             write_logls( "canceling gfac job with '$cmd'", 1 );
+                             shell_exec( $cmd );
+                         },
+                     ] ) ) {
+                    $work_done = 1;
+                }
+            } catch ( Exception $e ) {
+                write_logls( "analysis pipeline pass for db ${lims_db} failed: " . $e->getMessage() );
+                if ( false !== strpos( $e->getMessage(), "MySQL server has gone away" ) ) {
+                    db_connect();
+                    continue;
+                }
+            }
+        }
+
         # read from mysql - $submit_request_table_name
-        $query        = "SELECT ${id_field}, clusterDefault, status, currentGfacID, currentHPCARID, statusMsg, nextWaitStatus, nextWaitStatusMsg, statusJson, createUser, updateTime, stageSubmitTime FROM ${lims_db}.${submit_request_table_name}";
+        # (GMP autoflow rows only; pipeline rows have a pipelineID)
+        $query        = "SELECT ${id_field}, clusterDefault, status, currentGfacID, currentHPCARID, statusMsg, nextWaitStatus, nextWaitStatusMsg, statusJson, createUser, updateTime, stageSubmitTime FROM ${lims_db}.${submit_request_table_name}"
+                        . ( $pipeline_cols[ $lims_db ] ? " WHERE pipelineID IS NULL" : "" );
         
         $outer_result = mysqli_query( $db_handle, $query );
         if ( mysqli_error( $db_handle ) != "" ) {
