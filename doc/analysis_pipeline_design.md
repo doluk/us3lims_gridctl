@@ -298,15 +298,20 @@ cancels the pipeline; otherwise a failure would be archived before it could be r
 
 ### 6.5 Runtime edits (pipeline viewer)
 
-On `PENDING` rows: change `params`, `noise_from`, add/remove `after` edges, disable (→ `SKIPPED`).
-Disabling a row that others depend on re-links its successors to its predecessors; successors whose
-`noise_from` pointed to it must be given a new noise source first (V5). Validation is repeated on the
-expanded graph. Writes use `UPDATE … WHERE requestID=? AND JSON_EXTRACT(statusJson,'$.revision')=?` and
-increment `revision`; the scheduler does the same. Conflicts are reported to the user (reload).
+Implemented actions (`pl_row_action()`, `pl_cancel_pipeline()`):
 
-Cancel: row → `CANCELED` (running job: existing cancel path of `queue_viewer.php`); successors → `BLOCKED`.
-Retry: `FAILED`/`BLOCKED`/`CANCELED` → `PENDING`, its `BLOCKED` successors → `PENDING`.
-Cancel pipeline: all rows not `FINISHED`/`SKIPPED` → `CANCELED`, `analysisPipeline.status = CANCELED`.
+| action | allowed on | effect |
+|--------|-----------|--------|
+| retry | `FAILED`, `CANCELED` without attached cluster job | → `PENDING`; its `BLOCKED` successors return to `PENDING` on the next scheduler pass |
+| cancel | `PENDING`, `BLOCKED`, submitted/running (not `READY`: `submitone.php` is submitting it) | → `CANCELED`; the scheduler cancels the cluster job; successors → `BLOCKED` |
+| skip | `PENDING` with no stage waiting for it | → `SKIPPED` |
+| run (unskip) | `SKIPPED` | → `PENDING` |
+| cancel pipeline | `ACTIVE` pipeline | waiting/blocked rows → `CANCELED` at once; rows being submitted or running are canceled (and their jobs cancelled) by the next scheduler pass; then archived |
+
+Every row action is a single `UPDATE … WHERE requestID=? AND status=<seen> AND JSON_VALUE(statusJson,'$.revision')=<seen>`
+that increments `revision`; a concurrent change by the scheduler or another user is reported ("please reload").
+Not implemented: editing parameters, noise source or predecessors of `PENDING` rows (parameters are resolved from
+the stored spec when a row becomes `READY`); a new pipeline can be set up instead.
 
 Creation (LIMS page): insert `analysisPipeline` (`SETUP`), synchronise the `autoflowAnalysis` auto-increment with
 the history table (same statement as `set_autoflowAnalysis_auto_increment`, so a `requestID` is never reused),
@@ -382,7 +387,7 @@ their `editedDataID` (to verify: noise ↔ editedData link in the `noise` table)
 | `submitone.php` | v2: parameters from `statusJson.params` (no XML); `$_SESSION` from `spec.submitter`/`spec.requests`; `grid.type=custom` → 2DSA-CG; PCSA solute-type mapping reused; multi-dataset + advanced-review submission for groups (§7.2); input pinning (§8); `fit_mb_select = 0`. |
 | `jobmonitor/cleanup_gfac.php` | quote `autoflowID` and accept sentinel 0 (L5); for pipeline rows record outputs (model/noise IDs) in `statusJson.outputs`. |
 | `jobmonitor/gridctl.php` | none expected (status update by `requestID`+`currentGfacID` is row-level). |
-| new `autoflow_util/pipeline_lib.php` | shared: spec validation (V1–V7), expansion spec → rows (one per stage instance), parameter resolution, noise resolution, readiness. Used by submitctl, submitone and the LIMS pages; the dbinst pages include it from the gridctl install (path in `config.php`) or a copy is kept in `us3lims_dbinst/lib/`. |
+| new `autoflow_util/pipeline_lib.php` | shared: spec validation (V1–V7), expansion spec → rows (one per stage instance), parameter resolution, noise resolution, readiness. Used by submitctl, submitone and the LIMS pages (`us3lims_dbinst/lib/pipeline.php` looks it up as `$pipeline_lib` from `config.php`, `$class_dir/pipeline_lib.php`, or `/home/us3/lims/bin/autoflow_util/pipeline_lib.php`). |
 
 ### 9.2 `us3_sql` (done)
 
@@ -465,8 +470,8 @@ programs (e.g. `us_fematch`, `us_pseudo3d_combine`).
 | P2 | `submitctl.php` pipeline loop (scheduling incl. group readiness) (**done**) | gridctl |
 | P3 | `submitone.php` v2 params, custom grid, PCSA, input pinning — dataset stages (**done**; group rows fail with "can not be submitted yet") | gridctl |
 | P4 | Groups: multi-dataset advanced-review submission, member predecessors, blocking (**done**) | gridctl, dbinst (PCSA fix) |
-| P5 | `cleanup_gfac.php` sentinel autoflowID, outputs per row | gridctl |
-| P6 | `pipeline_setup.php` (from queue_setup_3) + `pipeline_viewer.php` (from queue_viewer) | dbinst |
+| P5 | `cleanup_gfac.php` sentinel autoflowID, outputs per row (**done**: outputs are read by the scheduler from `HPCAnalysisResultData`; model links work unchanged) | gridctl |
+| P6 | `pipeline_setup.php` (from queue_setup_3) + `pipeline_viewer.php` (from queue_viewer) (**done**) | dbinst |
 | P7 | Fix L3 for GMP rows | gridctl |
 
 P1–P3 give R1, R3, R4, R5 for single datasets; P4 adds R2.
@@ -517,6 +522,19 @@ P1–P3 give R1, R3, R4, R5 for single datasets; P4 adds R2.
   on a query without placeholders, which throws on PHP 8 and broke every PCSA submission (fixed in dbinst). The
   CLI path also relies on the instance `config.php` setting `$is_cli` and including `elog.php`, and on the
   LIMS reaching the `gfac` DB (same as the GMP path).
+
+### 13.1 LIMS pages (P6)
+
+* `queue_setup_3.php`: button "Setup Analysis Pipeline" (only if the library and the schema are present).
+* `pipeline_setup.php` + `js/pipeline_setup.js`: stage editor (shared parameters, dataset stages with
+  predecessors / noise source / settings / any further parameter, per-dataset stage selection and overrides,
+  groups with global stages), cluster selection as on the method pages (`tigre()`), *Validate* (server-side
+  `pl_expand_spec()`, summary of the stages to be created) and *Submit Pipeline* (`pl_create_pipeline()`).
+  Datasets, edits and noises come from the queue in the session, never from the browser.
+* `pipeline_viewer.php`: list (own pipelines; all for user level ≥ 4), stage table with state, predecessors,
+  noise source, HPC request, results and the actions of §6.5. Linked from `queue_viewer.php`.
+* Tests: `autoflow_util/tests/e2e/ui_run.sh` (Playwright: queue setup button → editor → validate → submit →
+  viewer actions → validation error → access of another user's pipeline).
 
 ## 14. Open questions
 

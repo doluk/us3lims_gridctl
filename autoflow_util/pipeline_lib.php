@@ -1147,7 +1147,20 @@ function pl_create_pipeline( $db, $lims_db, $spec, $name, $invID, $cluster ) {
     $res  = pl_query( $db, "SELECT GREATEST( IFNULL( (SELECT MAX(requestID) FROM $L.autoflowAnalysisHistory), 0 ), " .
                            "IFNULL( (SELECT MAX(requestID) FROM $L.autoflowAnalysis), 0 ) ) + 1 AS n" );
     $next = intval( mysqli_fetch_object( $res )->n );
-    pl_query( $db, "ALTER TABLE $L.autoflowAnalysis AUTO_INCREMENT = $next" );
+    try {
+        pl_query( $db, "ALTER TABLE $L.autoflowAnalysis AUTO_INCREMENT = $next" );
+    } catch ( PipelineDbException $e ) {
+        ## the LIMS DB user may lack ALTER; that is fine as long as the counter is already high enough
+        $d   = pl_esc( $db, $lims_db );
+        $res = pl_query( $db, "SELECT AUTO_INCREMENT AS a FROM information_schema.TABLES " .
+                              "WHERE TABLE_SCHEMA='$d' AND TABLE_NAME='autoflowAnalysis'" );
+        $ai  = intval( mysqli_fetch_object( $res )->a );
+        if ( $ai < $next ) {
+            throw new PipelineDbException( "autoflowAnalysis AUTO_INCREMENT ($ai) would reuse requestIDs of " .
+                                           "autoflowAnalysisHistory (max " . ( $next - 1 ) . ") and it can not be raised: " .
+                                           $e->getMessage() );
+        }
+    }
 
     mysqli_begin_transaction( $db );
     try {
@@ -1337,6 +1350,20 @@ function pl_process_pipeline( $db, $lims_db, $pid, $opts, &$spawn, &$scancel ) {
         $changed = true;
     }
 
+    ## 2a. canceled pipeline: cancel rows that are still being submitted or running
+    ##     (pl_cancel_pipeline() leaves rows alone that submitone.php may be updating)
+    if ( $p->status == 'CANCELED' ) {
+        foreach ( $rows as $id => $r ) {
+            $c = pl_status_class( $r[ 'status' ] );
+            if ( $c == 'active' || $c == 'pending' || $c == 'blocked' ) {
+                $sjs[ $id ][ 'processed' ][] = $processed( $id );
+                $save( $id, 'CANCELED', 'Pipeline canceled' );
+                $rows[ $id ][ 'statusMsg' ] = 'Pipeline canceled';
+                $changed = true;
+            }
+        }
+    }
+
     ## 2. failed / canceled jobs: cancel cluster job, normalise status
     foreach ( $rows as $id => $r ) {
         $c = pl_status_class( $r[ 'status' ] );
@@ -1407,3 +1434,154 @@ function pl_process_pipeline( $db, $lims_db, $pid, $opts, &$spawn, &$scancel ) {
     }
     return $changed;
 }
+
+## ------------------------------------------------------------------------
+## 7. reading and user actions (LIMS pipeline viewer)
+## ------------------------------------------------------------------------
+
+## pipelines of a person (null: all), newest first
+function pl_list_pipelines( $db, $lims_db, $personID = null, $limit = 200 ) {
+    $L = pl_ident( $lims_db );
+    $where = $personID === null ? "" : "WHERE p.invID=" . intval( $personID );
+    $res = pl_query( $db, "SELECT p.pipelineID, p.name, p.invID, p.status, p.createTime, p.updateTime, " .
+                          "CONCAT_WS(' ', pe.fname, pe.lname) AS owner, " .
+                          "(SELECT COUNT(*) FROM $L.autoflowAnalysis a WHERE a.pipelineID=p.pipelineID) AS live_rows " .
+                          "FROM $L.analysisPipeline p LEFT JOIN $L.people pe ON pe.personID=p.invID $where " .
+                          "ORDER BY p.pipelineID DESC LIMIT " . intval( $limit ) );
+    $out = [];
+    while ( $o = mysqli_fetch_assoc( $res ) ) {
+        $o[ 'counts' ] = [];
+        $out[ intval( $o[ 'pipelineID' ] ) ] = $o;
+    }
+    if ( count( $out ) ) {
+        ## stage counts per status (live rows only; archived pipelines are FINISHED/CANCELED)
+        $res = pl_query( $db, "SELECT pipelineID, UPPER(status) AS status, COUNT(*) AS n FROM $L.autoflowAnalysis " .
+                              "WHERE pipelineID IN (" . implode( ',', array_keys( $out ) ) . ") GROUP BY pipelineID, UPPER(status)" );
+        while ( $o = mysqli_fetch_assoc( $res ) ) {
+            $out[ intval( $o[ 'pipelineID' ] ) ][ 'counts' ][ $o[ 'status' ] ] = intval( $o[ 'n' ] );
+        }
+    }
+    return array_values( $out );
+}
+
+function pl_get_pipeline( $db, $lims_db, $pid ) {
+    $L   = pl_ident( $lims_db );
+    $res = pl_query( $db, "SELECT pipelineID, name, invID, clusterDefault, specJson, status, createTime, updateTime " .
+                          "FROM $L.analysisPipeline WHERE pipelineID=" . intval( $pid ) );
+    $o = mysqli_fetch_assoc( $res );
+    if ( !$o ) {
+        return null;
+    }
+    $o[ 'spec' ] = json_decode( $o[ 'specJson' ], true );
+    unset( $o[ 'specJson' ] );
+    return $o;
+}
+
+## rows of a pipeline (live, or archived in history), statusJson decoded as 'sj'
+function pl_get_pipeline_rows( $db, $lims_db, $pid ) {
+    $L    = pl_ident( $lims_db );
+    $pid  = intval( $pid );
+    $cols = "requestID, tripleName, rowKind, groupName, stageKey, status, statusMsg, currentGfacID, currentHPCARID, " .
+            "statusJson, stageSubmitTime, updateTime";
+    $res  = pl_query( $db, "SELECT $cols, 0 AS archived FROM $L.autoflowAnalysis WHERE pipelineID=$pid " .
+                           "UNION ALL SELECT $cols, 1 AS archived FROM $L.autoflowAnalysisHistory WHERE pipelineID=$pid " .
+                           "ORDER BY requestID" );
+    $out = [];
+    while ( $o = mysqli_fetch_assoc( $res ) ) {
+        $o[ 'sj' ] = json_decode( $o[ 'statusJson' ], true );
+        unset( $o[ 'statusJson' ] );
+        $out[ intval( $o[ 'requestID' ] ) ] = $o;
+    }
+    return $out;
+}
+
+/*
+ * User action on one row; $revision must be the statusJson revision the user saw.
+ *  retry   FAILED/CANCELED (no cluster job attached) -> PENDING
+ *  cancel  PENDING/BLOCKED or a submitted/running job -> CANCELED (the scheduler cancels the cluster job);
+ *          not while READY (submitone.php is about to submit it)
+ *  skip    PENDING -> SKIPPED, only if no other stage waits for it
+ *  unskip  SKIPPED -> PENDING
+ * Returns [ ok(bool), message ].
+ */
+function pl_row_action( $db, $lims_db, $pid, $requestID, $action, $revision ) {
+    $L   = pl_ident( $lims_db );
+    $pid = intval( $pid );
+    $id  = intval( $requestID );
+    $rev = intval( $revision );
+    $rows = pl_get_pipeline_rows( $db, $lims_db, $pid );
+    if ( !isset( $rows[ $id ] ) || $rows[ $id ][ 'archived' ] ) {
+        return [ false, "stage $id is not part of an active pipeline $pid" ];
+    }
+    $p = pl_get_pipeline( $db, $lims_db, $pid );
+    if ( $p[ 'status' ] != 'ACTIVE' ) {
+        return [ false, "pipeline is {$p['status']}" ];
+    }
+    $r  = $rows[ $id ];
+    $sj = $r[ 'sj' ];
+    if ( intval( $sj[ 'revision' ] ?? 0 ) != $rev ) {
+        return [ false, "stage $id was changed in the meantime, please reload" ];
+    }
+    $c = pl_status_class( $r[ 'status' ] );
+    switch ( $action ) {
+        case 'retry':
+            if ( !in_array( $c, [ 'failed', 'canceled' ] ) || !empty( $r[ 'currentGfacID' ] ) ) {
+                return [ false, "only failed or canceled stages without a running job can be retried" ];
+            }
+            $new = 'PENDING'; $msg = 'Retry requested';
+            $sj[ 'outputs' ] = null; $sj[ 'inputs' ] = null; $sj[ 'params' ] = null;
+            break;
+        case 'cancel':
+            if ( strtoupper( $r[ 'status' ] ) == 'READY' ) {
+                return [ false, "stage is being submitted right now, please try again in a minute" ];
+            }
+            if ( !in_array( $c, [ 'pending', 'blocked', 'active' ] ) ) {
+                return [ false, "only waiting, blocked or running stages can be canceled" ];
+            }
+            $new = 'CANCELED'; $msg = 'Canceled by user';
+            break;
+        case 'skip':
+            if ( $c != 'pending' ) {
+                return [ false, "only waiting stages can be skipped" ];
+            }
+            foreach ( $rows as $oid => $o ) {
+                if ( in_array( $id, $o[ 'sj' ][ 'after' ] ?? [] ) && !in_array( pl_status_class( $o[ 'status' ] ), [ 'skipped', 'canceled' ] ) ) {
+                    return [ false, "stage {$o['stageKey']} ({$o['tripleName']}) waits for this stage; skip or cancel it first" ];
+                }
+            }
+            $new = 'SKIPPED'; $msg = 'Skipped by user';
+            break;
+        case 'unskip':
+            if ( $c != 'skipped' ) {
+                return [ false, "stage is not skipped" ];
+            }
+            $new = 'PENDING'; $msg = 'Waiting for preceding stages';
+            break;
+        default:
+            return [ false, "unknown action" ];
+    }
+    $sj[ 'revision' ] = $rev + 1;
+    pl_query( $db, "UPDATE $L.autoflowAnalysis SET status='$new', statusMsg='" . pl_esc( $db, $msg ) . "', " .
+                   "statusJson='" . pl_esc( $db, pl_json( $sj ) ) . "' " .
+                   "WHERE requestID=$id AND pipelineID=$pid AND status='" . pl_esc( $db, $r[ 'status' ] ) . "' " .
+                   "AND JSON_VALUE(statusJson,'$.revision')=$rev" );
+    if ( mysqli_affected_rows( $db ) != 1 ) {
+        return [ false, "stage $id was changed in the meantime, please reload" ];
+    }
+    return [ true, "stage {$r['stageKey']} ({$r['tripleName']}): $msg" ];
+}
+
+## cancel a pipeline: waiting/blocked rows are canceled here, rows that are being submitted
+## or running are canceled by the scheduler (which also cancels their cluster jobs)
+function pl_cancel_pipeline( $db, $lims_db, $pid ) {
+    $L   = pl_ident( $lims_db );
+    $pid = intval( $pid );
+    pl_query( $db, "UPDATE $L.analysisPipeline SET status='CANCELED' WHERE pipelineID=$pid AND status='ACTIVE'" );
+    if ( mysqli_affected_rows( $db ) != 1 ) {
+        return [ false, "pipeline is not active" ];
+    }
+    pl_query( $db, "UPDATE $L.autoflowAnalysis SET status='CANCELED', statusMsg='Pipeline canceled' " .
+                   "WHERE pipelineID=$pid AND status IN ('PENDING','BLOCKED')" );
+    return [ true, "pipeline canceled" ];
+}
+
