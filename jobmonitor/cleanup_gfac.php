@@ -813,7 +813,7 @@ function update_autoflow_models( $modelID, $modelGUID, $editGUID ) {
         $query = "INSERT INTO ${us3_db}.autoflowModelsLink"
             . " set autoflowAnalysisID=$autoflowAnalysisID"
             . " ,modelsDesc='$descenc'"
-            . " ,autoflowID=$autoflowID"
+            . " ,autoflowID=" . intval( $autoflowID )   ## 0 for analysis pipeline rows (no autoflow record)
             ;
     }
 

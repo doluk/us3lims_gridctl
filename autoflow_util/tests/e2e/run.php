@@ -140,4 +140,27 @@ foreach ( [ 'g|G1|glit' => '2DSA', 'g|G1|glpc' => 'PCSA' ] as $k => $method ) {
     }
 }
 t_eq( count( file( "$E/submitted.log" ) ), 8, '8 jobs handed to the (stub) cluster submission' );
+
+t_section( 'job monitor (cleanup_gfac.php) on a pipeline row' );
+## the model bookkeeping of jobmonitor.php / cleanup_gfac.php, called as jobmonitor.php does
+function write_logld( $m ) {}
+function debug_json( $m, $j ) {}
+$test_db = $db;
+require_once "$GRIDCTL/jobmonitor/cleanup_gfac.php";    # sets globals of its own, e.g. $db = ''
+$db                 = $test_db;
+$db_handle          = $test_db;
+$us3_db             = $tdb;
+$gfacID             = "e2e-" . $byKey['g|G1|glit'];
+$autoflowAnalysisID = $byKey['g|G1|glit'];
+$t = get_autoflow_type_id();
+t_eq( [ $t->type, intval( $t->autoflowID ) ], [ '2DSA_GL_IT', 0 ], 'stage tag from statusJson.submitted, autoflowID 0' );
+$autoflowType = $t->type;
+$autoflowID   = $t->autoflowID;
+$guid = one( "SELECT editGUID FROM $L.editedData WHERE editedDataID=555" );
+update_autoflow_models( 9001, 'm-guid-1', $guid );
+update_autoflow_models( 9002, 'm-guid-2', $guid );
+$link = rows( "SELECT autoflowID, modelsDesc FROM $L.autoflowModelsLink WHERE autoflowAnalysisID=$autoflowAnalysisID" );
+t_eq( count( $link ), 1, 'one autoflowModelsLink row for the pipeline row' );
+t_eq( [ intval( $link[0]['autoflowID'] ), count( json_decode( $link[0]['modelsDesc'], true )['2DSA_GL_IT'] ?? [] ) ], [ 0, 2 ],
+      'models recorded under the stage tag, autoflowID 0' );
 t_done();
