@@ -139,7 +139,12 @@ $s[ 'stages' ] = [
     [ 'id' => 'it', 'method' => '2DSA_IT' ],
 ];
 $s[ 'datasets' ] = [];
-expect_error( $s, '/it must run after a/', 'V2 IT not after 2DSA' );
+expect_error( $s, "/stage 'a' must run after 'it' \(2DSA_IT\) or before it/", 'V2 2DSA unrelated to IT' );
+$s[ 'stages' ][ 1 ][ 'after' ] = [ 'a' ];
+t_eq( pl_expand_spec( $s )[ 'errors' ], [], 'V2 2DSA pre-fit before IT allowed' );
+$s[ 'stages' ] = [ [ 'id' => 'it', 'method' => '2DSA_IT', 'params' => [ 'noise_fit' => 'ti' ] ],
+                   [ 'id' => 'cg', 'method' => '2DSA', 'after' => [ 'it' ], 'params' => [ 'grid' => [ 'type' => 'custom', 'modelID' => 3 ] ] ] ];
+t_eq( pl_expand_spec( $s )[ 'errors' ], [], 'V2 2DSA (custom grid) after IT allowed' );
 $s = base_spec(); $s[ 'stages' ][] = [ 'id' => 'it2', 'method' => '2DSA_IT', 'after' => [ 'it' ] ];
 expect_error( $s, '/more than one enabled 2DSA_IT/', 'V2 two IT stages' );
 
@@ -165,6 +170,16 @@ $s = base_spec(); $s[ 'groups' ][ 0 ][ 'members' ] = [ '1.A.280' ];
 expect_error( $s, '/at least 2 members/', 'V6 single member group' );
 $s = base_spec(); $s[ 'groups' ][ 0 ][ 'members' ][] = 'nope';
 expect_error( $s, "/unknown member 'nope'/", 'V6 unknown member' );
+
+## V8
+$s = base_spec(); $s[ 'groups' ] = [];
+$s[ 'stages' ] = [ [ 'id' => 'a', 'method' => '2DSA', 'params' => [ 'noise_fit' => 'ti' ] ] ];
+$s[ 'datasets' ] = [];
+$s[ 'groups' ] = [ [ 'name' => 'G1', 'members' => [ '1.A.280', '1.B.280' ],
+                     'stages' => [ [ 'id' => 'gl', 'method' => '2DSA_GL', 'after_member' => [ 'a' ] ] ] ] ];
+expect_error( $s, "/member '1.A.280' has no preceding 2DSA_IT stage/", 'V8 group stage without member 2DSA_IT' );
+$s = base_spec(); $s[ 'groups' ][ 0 ][ 'stages' ][ 0 ][ 'after_member' ] = [ 'mc' ];
+t_eq( pl_expand_spec( $s )[ 'errors' ], [], 'V8 satisfied transitively (after member mc, which follows it)' );
 
 ## MC
 $s = base_spec(); $s[ 'stages' ][ 1 ][ 'params' ][ 'mc_iterations' ] = 1; unset( $s[ 'datasets' ][ '1.B.280' ][ 'stages' ][ 'mc' ] );
@@ -235,6 +250,20 @@ t_eq( [ $b[ 'page' ], $b[ 'post' ][ 'curve_type' ], $b[ 'post' ][ 'solute_type' 
 t_ok( !isset( $b[ 'post' ][ 's_value_max' ] ), 'PCSA ignores 2DSA keys' );
 t_eq( [ $b[ 'post' ][ 'tinoise_option' ], $b[ 'post' ][ 'rinoise_option' ] ], [ "0", "1" ], 'PCSA RI noise' );
 t_throws( function() { pl_build_post( 'PCSA', [ 'pcsa_solute_type' => 'x' ], 'c' ); }, 'unknown solute type throws' );
+
+t_section( 'group POST builder' );
+$gp = [ 'job' => [ 's_value_max' => 20, 'max_iterations' => 5, 'noise_fit' => 'ti' ],
+        'datasets' => [ 'A' => [ 'band_volume-value' => 0.015 ], 'B' => [ 'band_volume-value' => 0.010 ] ] ];
+$g = pl_build_group_posts( '2DSA_GL_IT', $gp, [ 'A', 'B' ], 'h:c:q' );
+t_eq( [ $g[ 'page' ], $g[ 'payload_class' ], count( $g[ 'posts' ] ) ], [ '2DSA_1.php', 'Payload_2DSA', 2 ], 'page, payload class, one post per member' );
+t_eq( [ $g[ 'posts' ][ 0 ][ 'band_volume-value' ], $g[ 'posts' ][ 1 ][ 'band_volume-value' ] ], [ "0.015", "0.01" ], 'dataset-level params per member' );
+t_eq( [ $g[ 'posts' ][ 0 ][ 's_value_max' ], $g[ 'posts' ][ 1 ][ 's_value_max' ], $g[ 'posts' ][ 0 ][ 'iterations_option' ] ], [ "20", "20", "1" ], 'job-level params identical' );
+t_eq( [ $g[ 'posts' ][ 0 ][ 'tinoise_option' ], $g[ 'posts' ][ 0 ][ 'rinoise_option' ] ], [ "0", "0" ], 'no noise fitting in global fits' );
+$gp[ 'job' ][ 'grid' ] = [ 'type' => 'custom', 'modelID' => 7 ];
+t_eq( pl_build_group_posts( '2DSA_GL', $gp, [ 'A', 'B' ], 'h:c:q' )[ 'payload_class' ], 'Payload_2DSA_CG', 'custom grid group job' );
+t_eq( pl_build_group_posts( 'PCSA_GL', $gp, [ 'A', 'B' ], 'h:c:q' )[ 'page' ], 'PCSA_1.php', 'PCSA group job' );
+t_throws( function() use ( $gp ) { pl_build_group_posts( '2DSA_IT', $gp, [ 'A', 'B' ], 'c' ); }, 'dataset method rejected' );
+t_throws( function() use ( $gp ) { pl_build_group_posts( '2DSA_GL', $gp, [ 'A' ], 'c' ); }, 'single member rejected' );
 
 ## ---------------------------------------------------------------- transitions
 

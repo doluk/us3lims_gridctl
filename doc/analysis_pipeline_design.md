@@ -237,12 +237,13 @@ scope and default iteration/MC settings.
 | V | rule |
 |---|------|
 | V1 | The expanded graph (dataset `after`, group `after_member`, edges implied by `noise_from`) is acyclic. |
-| V2 | `2DSA` and `2DSA_IT` of a dataset, if both enabled, are ordered `2DSA < 2DSA_IT`. Every other dataset stage must (directly or transitively) follow the last enabled one of them. |
+| V2 | At most one `2DSA_IT` per dataset. Every other stage of the dataset must follow it or precede it (directly or transitively). A plain `2DSA` can therefore be a pre-fit before IT or a later consumer (e.g. with a custom grid). |
 | V3 | Stages without a path between them are independent and run in parallel. The user may add extra `after` edges to force an order (e.g. to limit cluster load). |
 | V4 | A group stage's `after_member` stages must be enabled in **every** member (after dataset overrides); otherwise submission is rejected. |
 | V5 | `noise_from` is `queue_setup`, `none`, or a predecessor stage (direct or transitive) **that fits noise**. Group stages: `member:<stage>` with `<stage>` in `after_member` and fitting noise, or `queue_setup`/`none`. Group stages cannot fit noise (`noise_fit` forced `none`); a successor of a group stage therefore cannot take noise from it. |
 | V6 | A dataset may be a member of several groups; a group needs ≥ 2 members. |
 | V7 | Group job-level parameters come from the group (§7.2); member job-level overrides are ignored for group stages and the setup page warns about them. |
+| V8 | Every group stage must follow the `2DSA_IT` stage of **each** member. The LIMS scales global fits (2DSA and PCSA) by each dataset's total concentration from the latest 2DSA-IT model of its edit (`payload_manager::model_concentration`); without one, `file_writer` aborts with `2DSA-IT-MISSING`. |
 
 The user's example satisfies these rules: `2DSA_IT` precedes everything; `2DSA_MC`, `PCSA`, `2DSA_GL_IT`,
 `2DSA_GL_MC` only depend on (member) `2DSA_IT` and run in parallel.
@@ -336,10 +337,13 @@ The LIMS reads job-level parameters only from dataset 0 (`payload_manager.php:ac
 | job-level | `s_value_*`, `ff0_*`, grid points / `grid`, `max_iterations`, `mc_iterations`, PCSA curve options | group L0–L1–L2–L3 |
 | dataset-level | `band_volume-value`, `simpoints-value`, `radial_grid`, `time_grid`, `editedDataID`, `noiseIDs` | each member dataset's L0 + L2 (`datasets[key].params`); dataset-stage overrides (L3) do not apply to group stages |
 
-Submission of a group stage must use the LIMS **advanced-review path** (`$_SESSION['advanced_review']=1`):
-include `2DSA_1.php` once to initialise, once per dataset 0…N-2 with `next` + that dataset's `$_POST`, and
-once with `TIGRE` + the last dataset's `$_POST`. The current non-review path would apply identical
-dataset-level values to all members.
+Submission of a group stage uses the LIMS **advanced-review path** (`$_SESSION['advanced_review']=1`,
+`separate_datasets=0`), because the non-review path applies the same `$_POST` to all datasets. The method page
+can be included only once (it declares functions), so `submitone.php` does what the page's "Next Dataset"
+button does: it calls the page's payload manager (`Payload_2DSA`, `Payload_2DSA_CG`, `Payload_PCSA`)
+`acquirePostedData()` for datasets 0…N-2 with each dataset's `$_POST`, saves the payload in the session, then
+includes the page once with `TIGRE` and the last dataset's `$_POST`. The page acquires the last dataset and
+writes one global HPC request (`2DSA-GL-*`, `PCSA-GL-*`).
 
 ### 7.3 Analysis profile (GMP) rows
 
@@ -460,7 +464,7 @@ programs (e.g. `us_fematch`, `us_pseudo3d_combine`).
 | P1 | `pipeline_lib.php` (validation, expansion, resolution) + unit tests (CLI, fixtures) (**done**) | gridctl |
 | P2 | `submitctl.php` pipeline loop (scheduling incl. group readiness) (**done**) | gridctl |
 | P3 | `submitone.php` v2 params, custom grid, PCSA, input pinning — dataset stages (**done**; group rows fail with "can not be submitted yet") | gridctl |
-| P4 | Groups: multi-dataset advanced-review submission, member predecessors, blocking | gridctl (+ dbinst if form fixes needed) |
+| P4 | Groups: multi-dataset advanced-review submission, member predecessors, blocking (**done**) | gridctl, dbinst (PCSA fix) |
 | P5 | `cleanup_gfac.php` sentinel autoflowID, outputs per row | gridctl |
 | P6 | `pipeline_setup.php` (from queue_setup_3) + `pipeline_viewer.php` (from queue_viewer) | dbinst |
 | P7 | Fix L3 for GMP rows | gridctl |
@@ -493,7 +497,9 @@ P1–P3 give R1, R3, R4, R5 for single datasets; P4 adds R2.
 * **Tests**: `php autoflow_util/tests/pipeline_lib_test.php` (pure functions);
   `php autoflow_util/tests/pipeline_db_test.php <us3_sql>/us3.sql` (scheduler against a scratch MariaDB database,
   simulating `submit_local`/`gridctl`/`cleanup_gfac`; also passes with mysqli exception mode,
-  `PL_TEST_STRICT=1`).
+  `PL_TEST_STRICT=1`);
+  `autoflow_util/tests/e2e/run.sh` (real `us3lims_dbinst` pages from `submitone.php` to the HPC request and job
+  XML, cluster submission stubbed; modifies the machine, disposable containers only).
 * **Safety for GMP rows**: the GMP loop filters `pipelineID IS NULL` whenever the column exists, independent of
   whether `pipeline_lib.php` could be loaded. Databases without the upgrade behave exactly as before.
 * **Status mapping**: `COMPLETE`/`DONE` → outputs recorded → `FINISHED`; `FAILED`, `ERROR`, `SUBMIT_TIMEOUT`,
@@ -506,8 +512,14 @@ P1–P3 give R1, R3, R4, R5 for single datasets; P4 adds R2.
 * **Session**: e-mail and user level of the submitting user from the spec (no `us3-admin` override); cluster
   authorisations read from `people` at submit time. The LIMS pages require `userlevel >= 2`.
 * **Known gap**: a row stays `READY` if `submitone.php` dies before `submit_local.php` updates it (same as GMP).
+* **End-to-end findings (P4)**: global fits require each member's 2DSA-IT model (→ V8); a plain `2DSA` after IT
+  is a valid consumer (→ V2 relaxed); `HPC_PCSA::HPCJobParameters()` in `us3lims_dbinst` called `bind_param()`
+  on a query without placeholders, which throws on PHP 8 and broke every PCSA submission (fixed in dbinst). The
+  CLI path also relies on the instance `config.php` setting `$is_cli` and including `elog.php`, and on the
+  LIMS reaching the `gfac` DB (same as the GMP path).
 
 ## 14. Open questions
 
-None blocking. Noise ↔ edit mapping is resolved (`noise.editedDataID`, `model.editedDataID`). Still to verify in P4:
-the CLI behaviour of the LIMS advanced-review path for group submissions (§7.2).
+None blocking. Noise ↔ edit mapping is resolved (`noise.editedDataID`, `model.editedDataID`); the advanced-review
+CLI path for group submissions is verified end to end (§7.2, §13). Not yet tested: a real cluster run and
+multi-speed experiments (V8 is stricter than the LIMS there, which needs no 2DSA-IT model for >1 speed step).

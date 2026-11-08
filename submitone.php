@@ -193,7 +193,7 @@ write_logl( "connected to mysql: $dbhost, $user, $db.", 2 );
 
 # get AutoflowAnalysis record
 
-# analysis pipeline rows (pipelineID set) take their own path, see submit_pipeline_row()
+# analysis pipeline rows (pipelineID set) take their own path, see submit_pipeline_prepare()
 $pipelineID = 0;
 try {
     $result = mysqli_query( $db_handle, "SELECT pipelineID FROM ${lims_db}.${submit_request_table_name} WHERE ${id_field}=$ID" );
@@ -204,11 +204,30 @@ try {
     # no pipelineID column: database without pipeline schema
 }
 if ( $pipelineID > 0 ) {
-    $pipeline_page = submit_pipeline_prepare( $pipelineID );
-    if ( $pipeline_page ) {
-        # included at top level: the LIMS pages rely on globals from config.php / db.php
+    $pipeline_job = submit_pipeline_prepare( $pipelineID );
+    if ( $pipeline_job ) {
+        # everything below runs at top level: the LIMS pages rely on globals from config.php / db.php
         ob_start( "dump_it" );
-        include( $pipeline_page );
+        if ( count( $pipeline_job[ 'prefill' ] ) ) {
+            # global fit: acquire datasets 0..N-2 as the "Next Dataset" button of the method
+            # page does (advanced review), then the page acquires the last one on TIGRE
+            include_once 'checkinstance.php';
+            include_once 'db.php';
+            include_once 'lib/utility.php';
+            include_once 'lib/payload_manager.php';
+            $pipeline_payload = new $pipeline_job[ 'payload_class' ]( $_SESSION );
+            $pipeline_payload->clear();
+            foreach ( $pipeline_job[ 'prefill' ] as $pipeline_dsid => $pipeline_post ) {
+                $_REQUEST = $pipeline_post;
+                $_POST    = $pipeline_post;
+                $pipeline_payload->acquirePostedData( $pipeline_dsid, $pipeline_job[ 'count' ] );
+            }
+            $pipeline_payload->save();
+            unset( $pipeline_payload );
+        }
+        $_REQUEST = $pipeline_job[ 'post' ];
+        $_POST    = $pipeline_job[ 'post' ];
+        include( $pipeline_job[ 'page' ] );
         while ( ob_get_level() ) ob_end_flush();
         check_cli_errors_in_dump();
         check_cli_errors();
@@ -830,8 +849,10 @@ function submit_pipeline_cluster_string( $cluster ) {
     return "${host_name}:${cluster}:${queue}";
 }
 
-## prepares $_SESSION / $_POST for the LIMS method page and returns its path
-## (null if there is nothing to submit); exits via error() on failure
+## prepares $_SESSION for the LIMS method page; returns null if there is nothing
+## to submit, else [ 'page' => path, 'post' => POST of the (last) dataset,
+## 'prefill' => POSTs of datasets 0..N-2 (global fits only), 'payload_class', 'count' ];
+## exits via error() on failure
 function submit_pipeline_prepare( $pipelineID ) {
     global $db_handle, $lims_db, $ID, $id_field, $submit_request_table_name;
     global $www_uslims3, $host_name;
@@ -855,8 +876,9 @@ function submit_pipeline_prepare( $pipelineID ) {
     if ( !is_array( $sj ) || empty( $sj[ 'inputs' ] ) || !isset( $sj[ 'params' ] ) ) {
         error( "pipeline row has no resolved params/inputs" );
     }
-    if ( $row->rowKind == 'group' ) {
-        error( "global (group) stages can not be submitted yet" );
+    $is_group = $row->rowKind == 'group';
+    if ( $is_group && count( $sj[ 'inputs' ][ 'datasets' ] ) < 2 ) {
+        error( "global fit row has less than 2 datasets" );
     }
 
     $pipeline = db_obj_result( $db_handle,
@@ -888,24 +910,48 @@ function submit_pipeline_prepare( $pipelineID ) {
     # current authorizations from the people table (may have changed since the pipeline was created)
     $_SESSION[ 'clusterAuth' ]      = explode( ":", $person->clusterAuthorizations );
     $_SESSION[ 'gwhostid' ]         = $host_name;
-    $_SESSION[ 'separate_datasets' ] = 1;
+    # 0: global fit over all datasets of the request, 1: separate job
+    $_SESSION[ 'separate_datasets' ] = $is_group ? 0 : 1;
+    # global fits: every dataset's own POST is acquired (dataset-level params per member)
+    $_SESSION[ 'advanced_review' ]   = $is_group ? 1 : 0;
     $_SESSION[ 'request' ]          = [];
+    $keys = [];
     foreach ( $sj[ 'inputs' ][ 'datasets' ] as $input ) {
         $_SESSION[ 'request' ][]    = pl_session_request( $spec, $input );
+        $keys[]                     = $input[ 'key' ];
     }
 
+    $cluster = submit_pipeline_cluster_string( $row->clusterDefault );
     try {
-        $b = pl_build_post( $sj[ 'method' ], $sj[ 'params' ], submit_pipeline_cluster_string( $row->clusterDefault ) );
+        if ( $is_group ) {
+            $g     = pl_build_group_posts( $sj[ 'method' ], $sj[ 'params' ], $keys, $cluster );
+            $page  = $g[ 'page' ];
+            $posts = $g[ 'posts' ];
+            $class = $g[ 'payload_class' ];
+        } else {
+            $b     = pl_build_post( $sj[ 'method' ], $sj[ 'params' ], $cluster );
+            $page  = $b[ 'page' ];
+            $posts = [ $b[ 'post' ] ];
+            $class = pl_payload_class( $page );
+        }
     } catch ( Exception $e ) {
         error( $e->getMessage() );
     }
-    $_REQUEST = $b[ 'post' ];
-    $_POST    = $_REQUEST;
+    # the method page sets this from the POSTed cluster on TIGRE; the dataset 0
+    # acquisition of a prefilled global fit already reads it
+    list( $cluster_name, $cluster_shortname, $cluster_queue ) = explode( ":", $cluster );
+    $_SESSION[ 'cluster' ] = [ 'name' => $cluster_name, 'shortname' => $cluster_shortname, 'queue' => $cluster_queue ];
 
-    $page = "${php_base}/" . $b[ 'page' ];
-    echo "preparing to call $page\n";
+    $job = [
+        'page'          => "${php_base}/" . $page,
+        'post'          => array_pop( $posts ),
+        'prefill'       => $posts,
+        'payload_class' => $class,
+        'count'         => count( $keys ),
+    ];
+    echo "preparing to call {$job['page']} (" . count( $keys ) . " dataset(s))\n";
     echo "session now is:\n" . json_encode( $_SESSION, JSON_PRETTY_PRINT ) . "\n";
-    echo "request/post now is:\n" . json_encode( $_REQUEST, JSON_PRETTY_PRINT ) . "\n";
-    return $page;
+    echo "request/post now is:\n" . json_encode( $posts + [ count( $posts ) => $job[ 'post' ] ], JSON_PRETTY_PRINT ) . "\n";
+    return $job;
 }
 

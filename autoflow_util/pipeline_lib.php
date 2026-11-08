@@ -37,11 +37,11 @@ define( 'PL_SENTINEL_GUID', '00000000-0000-0000-0000-000000000000' );
 define( 'PL_SENTINEL_AUTOFLOWID', 0 );
 
 ## family: LIMS form family; scope: dataset|group; noise_fit: may fit noise;
-## conditioning: must precede all other stages of a dataset (V2)
+## conditioning: the stage every other stage of a dataset must follow or precede (V2)
 function pl_methods() {
     return [
-        '2DSA'       => [ 'family' => '2dsa', 'scope' => 'dataset', 'noise_fit' => true,  'conditioning' => 1 ],
-        '2DSA_IT'    => [ 'family' => '2dsa', 'scope' => 'dataset', 'noise_fit' => true,  'conditioning' => 2 ],
+        '2DSA'       => [ 'family' => '2dsa', 'scope' => 'dataset', 'noise_fit' => true,  'conditioning' => 0 ],
+        '2DSA_IT'    => [ 'family' => '2dsa', 'scope' => 'dataset', 'noise_fit' => true,  'conditioning' => 1 ],
         '2DSA_MC'    => [ 'family' => '2dsa', 'scope' => 'dataset', 'noise_fit' => true,  'conditioning' => 0 ],
         'PCSA'       => [ 'family' => 'pcsa', 'scope' => 'dataset', 'noise_fit' => true,  'conditioning' => 0 ],
         'PCSA_MC'    => [ 'family' => 'pcsa', 'scope' => 'dataset', 'noise_fit' => true,  'conditioning' => 0 ],
@@ -603,63 +603,53 @@ function pl_expand_spec( $spec ) {
         $anc[ $k ] = $a;
     }
 
-    ## --- V2: conditioning order per dataset ---
+    ## --- V2: 2DSA_IT first ---
+    ## At most one 2DSA_IT stage per dataset; every other stage of the dataset must either
+    ## follow it or precede it (e.g. a 2DSA pre-fit). A plain 2DSA may thus be a pre-fit or a
+    ## later consumer (e.g. with a custom grid). Group stages: see V8.
     foreach ( $requests as $key => $r ) {
-        $cond = [];
+        $it = null;
         foreach ( $rows as $k => $row ) {
-            if ( $row[ 'rowKind' ] != 'triple' || $row[ 'datasetKey' ] != $key ) {
-                continue;
-            }
-            $c = $methods[ $row[ 'method' ] ][ 'conditioning' ];
-            if ( $c ) {
-                if ( isset( $cond[ $c ] ) ) {
-                    $errors[] = "dataset '$key': more than one enabled {$row['method']} stage (V2)";
+            if ( $row[ 'rowKind' ] == 'triple' && $row[ 'datasetKey' ] == $key && $row[ 'method' ] == '2DSA_IT' ) {
+                if ( $it !== null ) {
+                    $errors[] = "dataset '$key': more than one enabled 2DSA_IT stage (V2)";
                 }
-                $cond[ $c ] = $k;
+                $it = $k;
             }
         }
-        ksort( $cond );
-        $chain = array_values( $cond );
-        for ( $i = 1; $i < count( $chain ); $i++ ) {
-            if ( !isset( $anc[ $chain[ $i ] ][ $chain[ $i - 1 ] ] ) ) {
-                $errors[] = "dataset '$key': {$rows[$chain[$i]]['stageKey']} must run after {$rows[$chain[$i-1]]['stageKey']} (V2)";
-            }
-        }
-        $last = count( $chain ) ? end( $chain ) : null;
-        if ( $last === null ) {
+        if ( $it === null ) {
             continue;
         }
         foreach ( $rows as $k => $row ) {
-            if ( $row[ 'rowKind' ] != 'triple' || $row[ 'datasetKey' ] != $key ) {
+            if ( $k == $it || $row[ 'rowKind' ] != 'triple' || $row[ 'datasetKey' ] != $key ) {
                 continue;
             }
-            if ( $methods[ $row[ 'method' ] ][ 'conditioning' ] ) {
-                continue;
-            }
-            if ( !isset( $anc[ $k ][ $last ] ) ) {
-                $errors[] = "dataset '$key': stage '{$row['stageKey']}' must run after '{$rows[$last]['stageKey']}' (V2)";
+            if ( !isset( $anc[ $k ][ $it ] ) && !isset( $anc[ $it ][ $k ] ) ) {
+                $errors[] = "dataset '$key': stage '{$row['stageKey']}' must run after '{$rows[$it]['stageKey']}' (2DSA_IT) or before it (V2)";
             }
         }
     }
-    ## group stages must follow each member's last conditioning stage
+
+    ## --- V8: global fits need a 2DSA-IT model of every member ---
+    ## The LIMS scales global fits by each dataset's total concentration, taken from the
+    ## latest 2DSA-IT model of the edit (payload_manager::model_concentration); without it
+    ## file_writer returns "2DSA-IT-MISSING". So each group stage must follow the 2DSA_IT
+    ## stage of every member.
     foreach ( $rows as $k => $row ) {
         if ( $row[ 'rowKind' ] != 'group' ) {
             continue;
         }
         foreach ( $row[ 'members' ] as $m ) {
-            $last = null;
-            $lastc = 0;
+            $found = false;
             foreach ( $rows as $kk => $rr ) {
-                if ( $rr[ 'rowKind' ] == 'triple' && $rr[ 'datasetKey' ] == $m ) {
-                    $c = $methods[ $rr[ 'method' ] ][ 'conditioning' ];
-                    if ( $c > $lastc ) {
-                        $lastc = $c;
-                        $last  = $kk;
-                    }
+                if ( $rr[ 'rowKind' ] == 'triple' && $rr[ 'datasetKey' ] == $m && $rr[ 'method' ] == '2DSA_IT'
+                     && isset( $anc[ $k ][ $kk ] ) ) {
+                    $found = true;
                 }
             }
-            if ( $last !== null && !isset( $anc[ $k ][ $last ] ) ) {
-                $errors[] = "group '{$row['groupName']}' stage '{$row['stageKey']}': must run after member '$m' stage '{$rows[$last]['stageKey']}' (V2)";
+            if ( !$found ) {
+                $errors[] = "group '{$row['groupName']}' stage '{$row['stageKey']}': member '$m' has no preceding 2DSA_IT stage; " .
+                            "global fits need each dataset's 2DSA-IT model (V8)";
             }
         }
     }
@@ -931,6 +921,46 @@ function pl_build_post( $method, $params, $cluster ) {
     $post[ 'rinoise_option' ] = $ri;
     $post[ 'cluster' ]        = $cluster;
     return [ 'page' => $page, 'post' => $post ];
+}
+
+## payload manager class of a LIMS method page (us3lims_dbinst lib/payload_manager.php)
+function pl_payload_class( $page ) {
+    $map = [ '2DSA_1.php' => 'Payload_2DSA', '2DSA-CG_1.php' => 'Payload_2DSA_CG', 'PCSA_1.php' => 'Payload_PCSA' ];
+    if ( !isset( $map[ $page ] ) ) {
+        throw new Exception( "no payload class for page $page" );
+    }
+    return $map[ $page ];
+}
+
+/*
+ * POSTs of a global (group) job, one per member dataset in $memberKeys order.
+ * The LIMS reads job-level parameters from dataset 0 only and dataset-level parameters
+ * from every dataset's POST (advanced review), so each POST is job-level params merged
+ * with that member's dataset-level params.
+ *  $params  resolved group params [ 'job' => [...], 'datasets' => [ key => [...] ] ]
+ * Returns [ 'page' => ..., 'payload_class' => ..., 'posts' => [ post0, post1, ... ] ].
+ */
+function pl_build_group_posts( $method, $params, $memberKeys, $cluster ) {
+    $methods = pl_methods();
+    if ( !isset( $methods[ $method ] ) || $methods[ $method ][ 'scope' ] != 'group' ) {
+        throw new Exception( "$method is not a group method" );
+    }
+    if ( count( $memberKeys ) < 2 ) {
+        throw new Exception( "a global fit needs at least 2 datasets" );
+    }
+    $page  = null;
+    $posts = [];
+    foreach ( $memberKeys as $key ) {
+        $p = array_replace( $params[ 'job' ], $params[ 'datasets' ][ $key ] ?? [] );
+        $p[ 'noise_fit' ] = 'none';
+        $b = pl_build_post( $method, $p, $cluster );
+        if ( $page !== null && $b[ 'page' ] != $page ) {
+            throw new Exception( "inconsistent LIMS page for group members" );
+        }
+        $page    = $b[ 'page' ];
+        $posts[] = $b[ 'post' ];
+    }
+    return [ 'page' => $page, 'payload_class' => pl_payload_class( $page ), 'posts' => $posts ];
 }
 
 ## $_SESSION['request'] entry for one dataset with pinned inputs
